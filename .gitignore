@@ -1,0 +1,29 @@
+# --- Secrets ---
+.env
+.env.*
+!.env.example
+token.txt
+secrets.py
+CHANGES.md
+
+# --- Python virtual environments ---
+.venv
+venv
+env/
+TELEGRAM_BOT/
+unibo-env/
+
+# --- Python bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS ---
+.DS_Store
+Thumbs.db

@@ -5,12 +5,15 @@ import json
 import csv
 import os
 
+from sensor import get_room_for_device, append_sensor_row
+from dotenv import load_dotenv  
 from paho.mqtt import client as mqtt_client
 
+load_dotenv()
 
 broker = os.getenv("MQTT_BROKER", "130.136.2.70")
 port = int(os.getenv("MQTT_PORT", "8080"))
-topics = ["sensor/temperature", "sensor/humidity"]
+topics = ["sensor/+/temperature", "sensor/+/humidity"]
 # Generate a Client ID with the subscribe prefix.
 client_id = f'subscribe-{random.randint(0, 100)}'
 username = os.getenv("MQTT_USER")
@@ -18,14 +21,7 @@ password = os.getenv("MQTT_PASS")
 if not all([broker, username, password]):
     raise SystemExit("ERROR: MQTT_BROKER, MQTT_USER, and MQTT_PASS must be set. Copy .env.example to .env and configure your MQTT credentials.")
 
-#configuration
-config = {
-    "readI": 1,
-    "readP": 10,
-    "activate": True
-}
-
-json_config_0 = json.dumps(config)
+seen_devices = set()  # Keep track of seen devices to avoid duplicate processing
 
 def connect_mqtt() -> mqtt_client:
     def on_connect(client, userdata, flags, reason_code, properties):
@@ -47,25 +43,31 @@ def connect_mqtt() -> mqtt_client:
 def subscribe(client: mqtt_client, topic):
     def on_message(client, userdata, msg):
         print(f"Received `{msg.payload.decode()}` from `{msg.topic}` topic")
-        data = json.loads(msg.payload.decode())
+        try:
+            data = json.loads(msg.payload.decode())
+        except Exception as e:
+            print(f"Bad payload: {e}")
+            return
+        measurement = data["measurement"]
+        parts = msg.topic.split("/")
+        device_id = parts[1]    # always the second part
+        measurement_type = parts[2]  # "temperature" or "humidity"
         timemsg = time.time()
-        row = [
-            timemsg, 
-            data.get("id"), 
-            data.get("room"), 
-            data["measurement"]["type"], 
-            data["measurement"]["min"], 
-            data["measurement"]["max"], 
-            data["measurement"]["media"], 
-            data["measurement"]["varianza"]
-        ]
-
-        # write CSV
-        with open("data.csv", "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(row)
-        print("invio")
-        client.publish("sensor/config_0", json_config_0)
+        
+        
+        room = get_room_for_device(device_id)
+        append_sensor_row(time.time(), device_id, room, measurement_type,
+                        measurement["min"], measurement["max"],
+                        measurement["media"], measurement["varianza"])
+        print("invio") 
+        # In on_message:
+        if device_id not in seen_devices:
+            seen_devices.add(device_id)
+            client.publish(
+                "discovery/devices",
+                json.dumps(list(seen_devices)),
+                retain=True
+            )
     client.subscribe(topic)
     client.on_message = on_message
 
@@ -74,6 +76,7 @@ def run():
     client = connect_mqtt()
     for cont in topics:
       subscribe(client, cont)
+    client.publish("discovery/devices", json.dumps(list(seen_devices)))
     client.loop_forever()
 
 

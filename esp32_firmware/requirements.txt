@@ -1,3 +1,4 @@
 # Development tools for flashing and interacting with ESP32
 mpremote>=1.0
+esptool
 # MicroPython firmware must be flashed separately (see firmware.bin)

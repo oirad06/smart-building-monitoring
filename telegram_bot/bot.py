@@ -25,7 +25,7 @@ from rooms import (
 )
 
 from dotenv import load_dotenv
-from paho.mqtt import client as mqtt_client
+from paho.mqtt import client as mqtt
 from telegram import (
     BotCommand,
     ForceReply,
@@ -60,14 +60,14 @@ password = os.getenv("MQTT_PASS")
 
 # Known ESP32 devices: {device_id: last_seen_epoch}, populated live from the bus.
 known_devices: dict[str, float] = {}
-mqtt_client: mqtt_client | None = None
+mqtt_client: mqtt.Client | None = None
 
 
-def connect_mqtt() -> mqtt_client:
+def connect_mqtt() -> mqtt.Client:
     cid = f"telegram-bot-{os.getpid()}"
-    client = mqtt_client.Client(
+    client = mqtt.Client(
         client_id=cid,
-        callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
     )
     if username and password:
         client.username_pw_set(username, password)

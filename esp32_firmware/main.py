@@ -3,10 +3,9 @@ print("Starting ESP32 firmware...")
 import time
 import dht
 import machine
-import math
 import json
 import network
-from umqttsimple import MQTTClient
+from umqttsimple import MQTTClient, MQTTException
 import ubinascii
 
 try:
@@ -22,138 +21,167 @@ ACTIVE = True
 MIN_VALUE = -100
 MAX_VALUE = 100
 
-Contatore = READ_PROCESSING // READ_INTERVAL
-minsensor = 0
-maxsensor = 0
-media = 0
-varianza = 0
-client_id = ubinascii.hexlify(machine.unique_id())
-device_id =client_id.decode()
+# Network/broker connect retry tuning.
+WIFI_CONNECT_TIMEOUT = 30      # seconds to wait for WiFi before resetting
+MQTT_RETRY_DELAY = 5           # seconds between broker reconnect attempts
+
+# device_id is the chip's unique silicon ID as a hex string. It is the single
+# source of identity: MQTT client_id, the {device_id} in every topic, and the
+# "device_id" field in every payload all use this same string.
+device_id = ubinascii.hexlify(machine.unique_id()).decode()
+
+CONFIG_TOPIC = b"sensor/" + device_id.encode() + b"/config"
+TEMP_TOPIC = b"sensor/" + device_id.encode() + b"/temperature"
+HUM_TOPIC = b"sensor/" + device_id.encode() + b"/humidity"
+
+
+def reads_per_window():
+    # Number of samples per aggregation window. Guarded against bad config:
+    # at least one read, and never a division by zero.
+    interval = READ_INTERVAL if READ_INTERVAL > 0 else 1
+    return max(1, READ_PROCESSING // interval)
+
+
+Contatore = reads_per_window()
 
 # Pin for Data
 d = dht.DHT11(machine.Pin(4))
 
-#Network
+
+# Network
 def do_connect():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     if not wlan.isconnected():
         print('connecting to network...')
         wlan.connect(wifi_ssid, wifi_password)
+        deadline = time.time() + WIFI_CONNECT_TIMEOUT
         while not wlan.isconnected():
+            if time.time() > deadline:
+                print('WiFi connect timed out; resetting.')
+                time.sleep(1)
+                machine.reset()
             machine.idle()
     print('network config:', wlan.ipconfig('addr4'))
 
-#configuration
+
+# configuration
 def sub_cb(topic, msg):
-  global READ_INTERVAL, READ_PROCESSING, ACTIVE, Contatore
-  if msg != None:
-      config = json.loads(msg)
-      READ_INTERVAL = int(config["read_interval"])
-      READ_PROCESSING = int(config["read_processing"])
-      ACTIVE = bool(config["active"])
-      Contatore = READ_PROCESSING // READ_INTERVAL
-      print("config: ", config)
-      print("actual config: ", READ_INTERVAL, READ_PROCESSING, ACTIVE)
+    global READ_INTERVAL, READ_PROCESSING, ACTIVE, Contatore
+    if msg is None:
+        return
+    try:
+        config = json.loads(msg)
+        interval = int(config["read_interval"])
+        processing = int(config["read_processing"])
+        active = bool(config["active"])
+    except (ValueError, KeyError, TypeError) as e:
+        print("Bad config payload, ignoring:", e)
+        return
+    if interval <= 0 or processing <= 0:
+        print("Invalid config (read_interval/read_processing must be > 0), ignoring.")
+        return
+    READ_INTERVAL = interval
+    READ_PROCESSING = processing
+    ACTIVE = active
+    Contatore = reads_per_window()
+    print("config: ", config)
+    print("actual config: ", READ_INTERVAL, READ_PROCESSING, ACTIVE)
+
+
+def connect_mqtt():
+    client = MQTTClient(device_id, mqtt_server, mqtt_port, user=mqtt_user, password=mqtt_pass)
+    client.set_callback(sub_cb)
+    client.connect()
+    client.subscribe(CONFIG_TOPIC)
+    print("Connected to MQTT broker and subscribed to config.")
+    return client
+
+
+def stats(values):
+    # min, max, mean, variance over a non-empty list.
+    n = len(values)
+    minv = min(values)
+    maxv = max(values)
+    mean = sum(values) / n
+    var = 0
+    for v in values:
+        var += (v - mean) * (v - mean)
+    var = var / n
+    return minv, maxv, mean, var
+
+
+def publish_measurement(client, topic, mtype, values):
+    minv, maxv, mean, var = stats(values)
+    print("-----STATISTICS-" + mtype.upper() + "-----")
+    print(mtype, "min:", minv, "max:", maxv, "media:", mean, "varianza:", var, "n:", len(values))
+    payload = {
+        "device_id": device_id,
+        "measurement": {
+            "type": mtype,
+            "min": minv,
+            "max": maxv,
+            "media": mean,
+            "varianza": var,
+        },
+    }
+    encoded = json.dumps(payload)
+    print(encoded)
+    client.publish(topic, encoded.encode())
+
 
 do_connect()
-client = MQTTClient(client_id, mqtt_server, mqtt_port, user=mqtt_user, password=mqtt_pass)
-client.set_callback(sub_cb)
-client.connect()
-client.subscribe(b"sensor/" + device_id.encode() + b"/config")
+client = connect_mqtt()
 
-#Superloop
+# Superloop
 while True:
-  # Poll for config messages; sub_cb applies them and rescales Contatore.
-  client.check_msg()
+    try:
+        # Poll for config messages; sub_cb applies them and rescales Contatore.
+        client.check_msg()
 
+        if ACTIVE is not True:
+            time.sleep(READ_INTERVAL)
+            continue
 
-  if ACTIVE != True:
-    continue
+        # measurements from sensor
+        try:
+            d.measure()
+            temp = d.temperature()
+            hum = d.humidity()
+        except OSError as e:
+            # DHT11 reads fail intermittently (timing/checksum); skip this sample.
+            print("DHT read failed, skipping:", e)
+            time.sleep(READ_INTERVAL)
+            continue
 
-  #measurments from sensor
-  d.measure()
-  temp = d.temperature()
-  hum = d.humidity()
+        if MIN_VALUE <= temp <= MAX_VALUE:
+            tempVal.append(temp)
+        if MIN_VALUE <= hum <= MAX_VALUE:
+            humVal.append(hum)
 
-  if MIN_VALUE <= temp <= MAX_VALUE:
-    tempVal.append(temp)
-  if MIN_VALUE <= hum <= MAX_VALUE:
-    humVal.append(hum)
+        if Contatore > 1:
+            Contatore -= 1
+        else:
+            Contatore = reads_per_window()
+            # Publish each measurement type independently so one empty window
+            # does not suppress the other.
+            if tempVal:
+                publish_measurement(client, TEMP_TOPIC, "temperature", tempVal)
+                tempVal.clear()
+            if humVal:
+                publish_measurement(client, HUM_TOPIC, "humidity", humVal)
+                humVal.clear()
 
-  if Contatore > 1:
-    Contatore -= 1
-  else:
-    Contatore = READ_PROCESSING // READ_INTERVAL
-    
+        time.sleep(READ_INTERVAL)
 
-    if len(tempVal) * len(humVal) != 0:
-      #temperature values
-      varianza = 0
-      minsensor = min(tempVal)
-      maxsensor = max(tempVal)
-      media = sum(tempVal) / len(tempVal)
-      for cont in range(0, len(tempVal)):
-        varianza += (tempVal[cont] - media) * (tempVal[cont] - media)
-      varianza = varianza / len(tempVal)
-
-      print("-----STATISTICS-TEMPERATURE-----")
-      print("temperature min: ", minsensor)
-      print("temperature max: ", maxsensor)
-      print("temperature media: ", media)
-      print("temperature varianza: ", varianza)
-      print("length array:", len(tempVal))
-      
-      tempVal.clear()
-      
-      datatemp = {
-        "device_id": device_id,
-        "measurement" : 
-          {
-            "type" : "temperature",
-            "min" : minsensor,
-            "max" : maxsensor,
-            "media" : media,
-            "varianza" : varianza
-          },
-      } 
-      
-      #humidity values
-      varianza = 0
-      minsensor = min(humVal)
-      maxsensor = max(humVal)
-      media = sum(humVal) / len(humVal)
-      for cont in range(0, len(humVal)):
-        varianza += (humVal[cont] - media) * (humVal[cont] - media)
-      varianza = varianza / len(humVal)
-      
-      print("-----STATISTICS-HUMIDITY-----")
-      print("humidity min: ", minsensor)
-      print("humidity max: ", maxsensor)
-      print("humidity media: ", media)
-      print("humidity varianza: ", varianza)
-      print("length array:", len(humVal))
-
-      humVal.clear()
-
-      datahum = {
-        "device_id": device_id,
-        "measurement" : 
-          {
-            "type" : "humidity",
-            "min" : minsensor,
-            "max" : maxsensor,
-            "media" : media,
-            "varianza" : varianza
-          }
-      }
-
-      # Publish json
-      json_datatemp = json.dumps(datatemp)
-      json_datahum = json.dumps(datahum)
-      print(json_datatemp)
-      print(json_datahum)
-      client.publish(b"sensor/" + device_id.encode() + b"/temperature", json_datatemp.encode())
-      client.publish(b"sensor/" + device_id.encode() + b"/humidity", json_datahum.encode())
-
-  time.sleep(READ_INTERVAL)
+    except (OSError, MQTTException) as e:
+        # Lost the broker (or WiFi). Reconnect with backoff instead of dying.
+        print("MQTT/network error, reconnecting:", e)
+        while True:
+            time.sleep(MQTT_RETRY_DELAY)
+            try:
+                do_connect()
+                client = connect_mqtt()
+                break
+            except (OSError, MQTTException) as e2:
+                print("Reconnect failed, retrying:", e2)

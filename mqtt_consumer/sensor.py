@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-DATA_DIR = Path("../data")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 ROOMS_FILE = DATA_DIR / "rooms.json"
 SENSORS_FILE = DATA_DIR / "sensors.csv"
 

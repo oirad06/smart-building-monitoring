@@ -1,331 +1,240 @@
-import logging
 import csv
-import os
-from datetime import datetime
-from pathlib import Path
+import io
 import json
-import random 
-import threading  
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-from actions import read_actions
-from rooms import add_room, room_exists, get_room_names, get_device_room
-from dotenv import load_dotenv  
+from actions import (
+    append_action,
+    delete_action_row,
+    read_actions,
+    update_action_row,
+)
+from rooms import (
+    add_room,
+    delete_room,
+    get_device_room,
+    get_room,
+    get_room_names,
+    remove_device_from_all_rooms,
+    room_exists,
+    update_room,
+)
+
+from dotenv import load_dotenv
 from paho.mqtt import client as mqtt_client
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    BotCommand,
+    ForceReply,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
     filters,
-    CallbackQueryHandler,
 )
-
 
 load_dotenv()
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths & MQTT
+# ─────────────────────────────────────────────────────────────────────────────
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 broker = os.getenv("MQTT_BROKER", "130.136.2.70")
 port = int(os.getenv("MQTT_PORT", "8080"))
-
-# Generate a Client ID with the subscribe prefix.
-client_id = f'subscribe-{random.randint(0, 100)}'
 username = os.getenv("MQTT_USER")
 password = os.getenv("MQTT_PASS")
-if not all([broker, username, password]):
-    raise SystemExit("ERROR: MQTT_BROKER, MQTT_USER, and MQTT_PASS must be set. Copy .env.example to .env and configure your MQTT credentials.")
+
+# Known ESP32 devices: {device_id: last_seen_epoch}, populated live from the bus.
+known_devices: dict[str, float] = {}
+mqtt_client: mqtt_client | None = None
+
 
 def connect_mqtt() -> mqtt_client:
-    def on_connect(client, userdata, flags, reason_code, properties):
-        if reason_code == 0:
-            print("Connected to MQTT Broker!")
-        else:
-            print(f"Failed to connect, return code {reason_code}")
-
+    cid = f"telegram-bot-{os.getpid()}"
     client = mqtt_client.Client(
-        client_id=client_id,
+        client_id=cid,
         callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2,
     )
-    client.username_pw_set(username, password)
-    client.on_connect = on_connect
+    if username and password:
+        client.username_pw_set(username, password)
     client.connect(broker, port)
     return client
 
-client = connect_mqtt()
-client.subscribe("sensor/+/+")
-client.loop_start()
 
+def _on_mqtt_message(client, userdata, msg):
+    """Live device discovery: learn device IDs from any sensor message + the
+    retained discovery snapshot published by the consumer."""
+    if msg.topic == "discovery/devices":
+        try:
+            for dev in json.loads(msg.payload.decode()):
+                known_devices.setdefault(dev, time.time())
+        except Exception:
+            pass
+        return
+    parts = msg.topic.split("/")
+    if len(parts) == 3 and parts[0] == "sensor":
+        known_devices[parts[1]] = time.time()
+
+
+def send_device_config(device_id, read_interval, read_processing, active):
+    if mqtt_client is None:
+        return
+    payload = json.dumps({
+        "read_interval": read_interval,
+        "read_processing": read_processing,
+        "active": active,
+    })
+    mqtt_client.publish(f"sensor/{device_id}/config", payload)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Logging
+# ─────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Conversation states
-(ROOM_NAME, NCOND, DEVICE_SELECTION,STANZAP,NPERSONE,STANZAC,NCONDFREDDI,NCONDCALDI,STANZACLEAR,DELETEROOM,DEVICE_SELECTIONC,NREADINTERVAL,NREADPROCESSING,NACTIVE) = range(14)
-DATA_DIR = Path("../data")
-DATA_DIR.mkdir(exist_ok=True)
-REGISTRY_FILE = DATA_DIR / "stanze.json"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversation states (non-overlapping ranges per handler)
+# ─────────────────────────────────────────────────────────────────────────────
+# /setup
+ROOM_NAME, AC_COUNT, DEVICE_SELECTION = range(3)
+# /event
+EVENT_ROOM, EVENT_PEOPLE, EVENT_COOL, EVENT_HEAT = range(10, 14)
+# /devices
+DEV_SELECT, DEV_INTERVAL, DEV_PROCESSING, DEV_ACTIVE = range(20, 24)
+# /rooms
+RM_PICK, RM_MENU, RM_RENAME, RM_AC, RM_DEVICES, RM_DELETE = range(30, 36)
+# /events
+EV_PAGE, EV_EDIT_PEOPLE, EV_EDIT_COOL, EV_EDIT_HEAT = range(40, 44)
+
+ROOMS_PER_PAGE = 0  # unused sentinel
+EVENTS_PER_PAGE = 10
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def number_keyboard(placeholder="Numero (>= 0)"):
+    return ReplyKeyboardMarkup(
+        [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["0"]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder=placeholder,
+    )
+
+
+def room_buttons(prefix="room_", extra=None):
+    rows = [[InlineKeyboardButton(name, callback_data=f"{prefix}{name}")] for name in get_room_names()]
+    if extra:
+        rows += extra
+    return InlineKeyboardMarkup(rows)
+
+
+def get_known_devices():
+    """Return device IDs seen recently (last 5 min) first, then stale ones."""
+    now = time.time()
+    fresh = [d for d, t in known_devices.items() if now - t < 300]
+    stale = [d for d in known_devices if d not in fresh]
+    return fresh + stale
+
+
+def device_keyboard(devices, assigned, selected):
+    rows = []
+    for dev in devices:
+        room = assigned.get(dev)
+        mark = "✅ " if dev in selected else ""
+        label = mark + dev + (f" ({room})" if room else "")
+        rows.append([InlineKeyboardButton(label, callback_data=dev)])
+    rows.append([InlineKeyboardButton("Done", callback_data="done")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _parse_ts(s):
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return datetime.fromisoformat(str(s)).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _fmt_time(s):
+    ts = _parse_ts(s)
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
+
+
+def read_sensors():
+    path = DATA_DIR / "sensors.csv"
+    if not path.exists():
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /start, /help, /cancel
+# ─────────────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    await update.message.reply_html(
-        rf"Buondì {user.mention_html()}!\n"
-        "Sono il temperature_events_bot.\n\n"
-        "Usa /setup per inserire una nuova rilevazione.",
-        reply_markup=ForceReply(selective=True),
+    await update.message.reply_text(
+        "Benvenuto in Smart Building Monitor. Usa /help per la lista comandi."
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    command_list = [["/setup", "/npersone", "/ncondizionatori", "/cancel", "/clearline",  "/help", "/deleteroom"]]
     await update.message.reply_text(
-        "comandi:\n"
-        "-/setup - nuova rilevazione (per creare nuovo file stanza)\n"
-        " per aggiornare dati nelle stanze:\n"
-        "-/npersone - numero persone in una stanza\n"
-        "-/ncondizionatori - numero condizionatori freddi e caldi in una stanza\n"
-        " per vedere i comandi:\n"
-        "-/help - mostra i comandi (il comando più utile del mondo!!!)\n"
-        " per annullare un'operazione:\n"
-        "-/cancel - annulare un comando\n"
-        "-/clearline - rimuovere una riga di un file o nel caso non ci sia scritto nulla eliminare il file\n"
-        "-/deleteroom - elimina una stanza e il relativo file csv\n"
-        "-/sensorsdownload - download il relativo file csv\n"
-        "-/actionsdownload - download il relativo file csv\n"
-        "-/roomsdownload - download il relativo file json\n"
-        "-/config - config degli esp32",
-        reply_markup=ReplyKeyboardMarkup(
-          command_list, one_time_keyboard=True, input_field_placeholder="scegli un comando"
-          ),
+        "Comandi disponibili:\n"
+        "/setup — crea una nuova stanza\n"
+        "/rooms — gestisci le stanze (rinomina, AC, dispositivi, elimina)\n"
+        "/event — registra un evento (persone + condizionatori)\n"
+        "/events — modifica o elimina eventi recenti\n"
+        "/devices — configura i sensori ESP32\n"
+        "/show — mostra dati sensori + eventi\n"
+        "/sensors — scarica sensors.csv\n"
+        "/actions — scarica actions.csv\n"
+        "/config — scarica rooms.json\n"
+        "/cancel — annulla l'operazione in corso"
     )
 
-def carica_stanze():
-    if not REGISTRY_FILE.exists():
-        return {}
 
-    with open(REGISTRY_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def salva_stanze(stanze):
-    with open(REGISTRY_FILE, "w", encoding="utf-8") as f:
-        json.dump(stanze, f, indent=4, ensure_ascii=False)
-
-
-def registra_stanza(nome_stanza, ncond, csv_file):
-    stanze = carica_stanze()
-
-    stanze[nome_stanza] = {
-        "csv_file": str(csv_file),
-        "ncond": ncond
-    }
-
-    salva_stanze(stanze)
-
-
-def get_reply_keyboard():
-    rooms = get_room_names()
-
-    if not rooms:
-        return []  # IMPORTANT: never fake a button
-
-    keyboard = []
-    row = []
-
-    for room in rooms:
-        row.append(room)
-
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-
-    if row:
-        keyboard.append(row)
-
-    return keyboard
-
-def rimuovi_ultima_riga(csv_file):
-    with open(csv_file, "r", encoding="utf-8") as f:
-        righe = list(csv.reader(f))
-
-    if len(righe) <= 1:
-        return False
-
-    righe.pop()
-
-    with open(csv_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerows(righe)
-
-    return True
-
-async def clearline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Di quale stanza vuoi cancellare l'ultima rilevazione?",
-        reply_markup=ReplyKeyboardMarkup(
-            get_reply_keyboard(),
-            one_time_keyboard=True
-        )
-    )
-    return STANZACLEAR
-
-async def salva_clearline(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stanza = update.message.text.strip()
-    csv_file = DATA_DIR / f"actions.csv"
-
-    if not csv_file.exists():
-        await update.message.reply_text(
-            "File non trovato.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
-
-    if rimuovi_ultima_riga(csv_file):
-        await update.message.reply_text(
-            "Ultima riga eliminata.",
-            reply_markup=ReplyKeyboardRemove()
-        )
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text("Operazione annullata.")
     else:
-        await update.message.reply_text(
-            "Il file è vuoto.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        
+        await update.message.reply_text("Operazione annullata.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-def leggi_ultima_riga(csv_file):
-    try:
-        with open(csv_file, "r", encoding="utf-8") as file:
-            righe = list(csv.DictReader(file))
 
-        if not righe:
-            return None
-
-        return righe[-1]
-
-    except Exception:
-        return None
-
-def elimina_stanza(nome_stanza):
-    stanze = carica_stanze()
-
-    if nome_stanza not in stanze:
-        return False
-
-    del stanze[nome_stanza]
-    salva_stanze(stanze)
-
-    return True
-
-async def deleteroom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Quale stanza vuoi eliminare?",
-        reply_markup=ReplyKeyboardMarkup(
-            get_reply_keyboard(),
-            one_time_keyboard=True
-        )
-    )
-
-    return DELETEROOM
-
-async def salva_deleteroom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stanza = update.message.text.strip()
-
-    stanze = carica_stanze()
-
-    if stanza not in stanze:
-        await update.message.reply_text(
-            "Stanza non trovata.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
-
-    csv_file = Path(stanze[stanza]["csv_file"])
-
-    if csv_file.exists():
-        csv_file.unlink()  # elimina il csv
-
-    elimina_stanza(stanza)
-
-    await update.message.reply_text(
-        f"Stanza '{stanza}' eliminata.",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    return ConversationHandler.END
-
-async def sensors_download(update, context):
-    if not (DATA_DIR / "sensors.csv").exists() or (DATA_DIR / "sensors.csv").stat().st_size == 0:
-        await update.message.reply_text("Il file sensors.csv non esiste.")
-    else:
-        await update.message.reply_document(document=open("../data/sensors.csv", "rb"))
-
-async def actions_download(update, context):
-    if not (DATA_DIR / "actions.csv").exists() or (DATA_DIR / "actions.csv").stat().st_size == 0:
-        await update.message.reply_text("Il file actions.csv non esiste.")
-    else:
-        await update.message.reply_document(document=open("../data/actions.csv", "rb"))
-
-async def rooms_download(update, context):
-    if not (DATA_DIR / "rooms.json").exists() or (DATA_DIR / "rooms.json").stat().st_size == 0:
-        await update.message.reply_text("Il file rooms.json non esiste.")
-    else:
-        await update.message.reply_document(document=open("../data/rooms.json", "rb"))
-
-def send_device_config(device_id, read_interval, read_processing, active):
-    payload = json.dumps({
-        "read_interval": read_interval,
-        "read_processing": read_processing,
-        "active": active
-    })
-
-    client.publish(f"sensor/{device_id}/config", payload)
-
-async def rooms_list(update, context):
-    rooms = get_room_names()
-    keyboard = [[InlineKeyboardButton(name, callback_data=f"room_{name}")] for name in rooms]
-    await update.message.reply_text("Scegli una stanza:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-def build_device_selection_keyboard(devices, assigned):
-    keyboard = []
-    for device in devices:
-        room = assigned.get(device)
-        label = f"{device} ({room})" if room else device
-        keyboard.append([InlineKeyboardButton(label, callback_data=device)])
-    keyboard.append([InlineKeyboardButton("Done", callback_data="done")])
-    return InlineKeyboardMarkup(keyboard)
-
-def get_known_devices():
-    result = []
-    event = threading.Event()
-
-    def on_message(client, userdata, msg):
-        nonlocal result
-        result = json.loads(msg.payload.decode())
-        event.set()
-
-    c = connect_mqtt()
-    c.subscribe("discovery/devices")
-    c.on_message = on_message
-    c.loop_start()
-
-    event.wait(timeout=3)
-
-    c.loop_stop()
-    c.disconnect()
-
-    return result
-#setup 
-async def setup_start(update, context):
+# ─────────────────────────────────────────────────────────────────────────────
+# /setup — create room (name → AC count → device multi-select → save)
+# ─────────────────────────────────────────────────────────────────────────────
+async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Inserisci il nome della stanza:")
     return ROOM_NAME
 
-async def save_room_name(update, context):
+
+async def save_room_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
         await update.message.reply_text("Il nome non può essere vuoto.")
@@ -333,621 +242,804 @@ async def save_room_name(update, context):
     if room_exists(name):
         await update.message.reply_text("Esiste già una stanza con questo nome.")
         return ROOM_NAME
-    
     context.user_data["room_name"] = name
     await update.message.reply_text("Quanti condizionatori ci sono?", reply_markup=ForceReply())
-    return NCOND
+    return AC_COUNT
 
-async def save_ac_count(update, context):
+
+async def save_ac_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         count = int(update.message.text)
-
         if count < 0:
             raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Inserisci un numero valido >= 0.")
+        return AC_COUNT
 
-        context.user_data["num_ac"] = count
+    context.user_data["num_ac"] = count
+    devices = get_known_devices()
+    assigned = {d: get_device_room(d) for d in devices}
+    context.user_data["devices"] = devices
+    context.user_data["assigned"] = assigned
+    context.user_data["selected_devices"] = []
 
-        devices = get_known_devices()
-        assigned = {dev: get_device_room(dev) for dev in devices}
+    await update.message.reply_text(
+        "Seleziona i dispositivi per questa stanza:",
+        reply_markup=device_keyboard(devices, assigned, []),
+    )
+    return DEVICE_SELECTION
 
-        context.user_data["devices"] = devices
-        context.user_data["assigned"] = assigned
-        context.user_data["selected_devices"] = []
 
-        keyboard = build_device_selection_keyboard(devices, assigned)
-
-        await update.message.reply_text(
-            "Seleziona i dispositivi per questa stanza:",
-            reply_markup=keyboard
-        )
-
-        return DEVICE_SELECTION
-
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NCOND
-
-async def save_devices(update, context):
+async def save_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     selected = context.user_data.setdefault("selected_devices", [])
     devices = context.user_data["devices"]
     assigned = context.user_data["assigned"]
 
     if query.data == "done":
-
         room_name = context.user_data["room_name"]
-        num_ac = context.user_data["num_ac"]
 
+        # Reassignment guard: warn once, then on confirm strip devices from old rooms.
         warnings = []
-
         for dev in selected:
-            current_room = get_device_room(dev)
-
-            if current_room:
-                warnings.append(
-                    f"{dev} è già assegnato alla stanza '{current_room}'"
-                )
+            current = get_device_room(dev)
+            if current:
+                warnings.append(f"{dev} è già assegnato a '{current}'")
 
         if warnings and not context.user_data.get("confirmed"):
             context.user_data["confirmed"] = True
-
             await query.message.reply_text(
-                "ATTENZIONE:\n"
-                + "\n".join(warnings)
-                + "\n\nPremi di nuovo Done per confermare."
+                "ATTENZIONE:\n" + "\n".join(warnings) + "\n\nPremi di nuovo Done per confermare."
             )
-
             return DEVICE_SELECTION
 
-        add_room(room_name, selected, num_ac)
-
+        for dev in selected:
+            remove_device_from_all_rooms(dev, except_room=room_name)
+        add_room(room_name, selected, context.user_data["num_ac"])
         await query.edit_message_text(
             f"✅ Stanza '{room_name}' creata.\n"
-            f"Dispositivi associati: {', '.join(selected) if selected else 'nessuno'}"
+            f"Dispositivi: {', '.join(selected) if selected else 'nessuno'}"
         )
-
+        context.user_data.clear()
         return ConversationHandler.END
 
+    # toggle a device
     device = query.data
-
     if device in selected:
         selected.remove(device)
     else:
         selected.append(device)
-
-    keyboard = []
-
-    for dev in devices:
-        room = assigned.get(dev)
-
-        if dev in selected:
-            prefix = "✅ "
-        else:
-            prefix = ""
-
-        label = prefix + dev
-
-        if room:
-            label += f" ({room})"
-
-        keyboard.append(
-            [InlineKeyboardButton(label, callback_data=dev)]
-        )
-
-    keyboard.append(
-        [InlineKeyboardButton("Done", callback_data="done")]
-    )
-
     await query.edit_message_reply_markup(
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=device_keyboard(devices, assigned, selected)
     )
-
     return DEVICE_SELECTION
 
-async def salva_ncond(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        valore = int(update.message.text)
 
-        if valore < 0:
-            raise ValueError
-
-        context.user_data["ncond"] = valore
-
-        csv_file_events = DATA_DIR / f"actions.csv"
-        
-        registra_stanza(
-          context.user_data["stanza"],
-          context.user_data["ncond"],
-          csv_file_events
-        )
-
-        file_exists = csv_file_events.exists()
-        
-        with open(csv_file_events, "a", newline="", encoding="utf-8") as file:
-            writer = csv.writer(file)
-
-            if not file_exists:
-                writer.writerow([
-                    "timestamp",
-                    "stanza",
-                    "ncond",
-                    "npersone",
-                    "ncondfreddi",
-                    "ncondcaldi",
-                    "ncondspenti"
-                ])
-
-            writer.writerow([
-                datetime.now().isoformat(),
-                context.user_data["stanza"],
-                context.user_data["ncond"],
-                context.user_data["npersone"],
-                context.user_data["ncondfreddi"],
-                context.user_data["ncondcaldi"],
-                context.user_data["ncond"] - (context.user_data["ncondfreddi"] + context.user_data["ncondcaldi"])
-            ])
-
+# ─────────────────────────────────────────────────────────────────────────────
+# /rooms — manage existing rooms
+# ─────────────────────────────────────────────────────────────────────────────
+async def rooms_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    names = get_room_names()
+    if not names:
+        await update.message.reply_text("Nessuna stanza. Creane una con /setup.")
         return ConversationHandler.END
-
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NCOND
-
-# STEP 1
-async def npersone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Di quale stanza stiamo raccogliendo i dati?",
-        reply_markup=ReplyKeyboardRemove()   # reset first
-    )
-
-    await update.message.reply_text(
-        "Seleziona la stanza:",
-        reply_markup=ReplyKeyboardMarkup(
-            get_reply_keyboard(),
-            resize_keyboard=True,
-            one_time_keyboard=True
-        ),
-    )
-
-    return STANZAP
-
-# STEP 2
-async def salva_stanzap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stanza = update.message.text.strip()
-
-    rooms = get_room_names()
-
-    if stanza not in rooms:
-        await update.message.reply_text(
-            "Stanza non valida. Usa una delle stanze disponibili.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ConversationHandler.END
-
-    context.user_data["stanza"] = stanza
-
-    await update.message.reply_text(
-        "Quante persone ci sono nella stanza?",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    return NPERSONE
-
-async def salva_npersone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        valore = int(update.message.text)
-
-        if valore < 0:
-            raise ValueError
-
-        context.user_data["npersone"] = valore
-
-        csv_file_events = DATA_DIR / f"actions.csv"
-        
-        if not csv_file_events.exists():
-            open(csv_file_events, "w").close()  # create empty file if it doesn't exist
-
-        ultima = leggi_ultima_riga(csv_file_events)
-
-        with open(csv_file_events, "a", newline="", encoding="utf-8") as file:
-            writer = csv.writer(file)
-
-            writer.writerow([
-                datetime.now().isoformat(),
-                context.user_data["stanza"],
-                -1,
-                context.user_data["npersone"],
-                -1,
-                -1,
-                -1,
-            ])
-
-        return ConversationHandler.END
-
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NPERSONE
-
-async def ncondizionatori(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Di quale stanza stiamo raccogliendo i dati?",
-        reply_markup=ReplyKeyboardMarkup(
-          get_reply_keyboard(), one_time_keyboard=True, input_field_placeholder="Quale stanza?"
-          ),
-        )
-    return STANZAC
+    await update.message.reply_text("Scegli una stanza:", reply_markup=room_buttons())
+    return RM_PICK
 
 
-# STEP 2
-async def salva_stanzac(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["stanza"] = update.message.text.strip()
-
-
-    await update.message.reply_text(
-        "Quanti condizionatori freddi ci sono nella stanza?",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-    return NCONDFREDDI
-
-async def salva_ncondfreddi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-      valore = int(update.message.text)
-
-      if valore < 0:
-        raise ValueError
-
-      context.user_data["ncondfreddi"] = valore
-
-
-      await update.message.reply_text(
-        "Quanti condizionatori caldi ci sono nella stanza?"
-      )
-      return NCONDCALDI
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NCONDFREDDI
-
-async def salva_ncondcaldi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        valore = int(update.message.text)
-
-        if valore < 0:
-            raise ValueError
-        
-        csv_file_events = DATA_DIR / f"actions.csv"
-
-        if not csv_file_events.exists():
-            open(csv_file_events, "w").close()  # create empty file if it doesn't exist
-
-        ultima = leggi_ultima_riga(csv_file_events)
-
-        if context.user_data["ncondfreddi"] + valore > int(ultima["ncond"]):
-          await update.message.reply_text("Il numero di condizionatori accesi supera il totale.")
-          return NCONDCALDI
-
-        context.user_data["ncondcaldi"] = valore
-
-
-        ultima = leggi_ultima_riga(csv_file_events)
-        with open(csv_file_events, "a", newline="", encoding="utf-8") as file:
-              writer = csv.writer(file)
-
-              writer.writerow([
-                datetime.now().isoformat(),
-                context.user_data["stanza"],
-                -1,
-                -1,
-                context.user_data["ncondfreddi"],
-                context.user_data["ncondcaldi"],
-                -1
-              ])
-
-        return ConversationHandler.END
-
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NCONDCALDI
-
-async def config(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    devices = get_known_devices()
-    assigned = {dev: get_device_room(dev) for dev in devices}
-    if not devices:
-      await update.message.reply_text(
-        "Nessun dispositivo trovato."
-      )
-      return ConversationHandler.END
-    await update.message.reply_text(
-        "Seleziona un device:",
-        reply_markup=build_device_selection_keyboard(devices, assigned)
-    )
-    return DEVICE_SELECTIONC
-
-
-# STEP 2
-async def salva_device(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def rooms_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "done":
-      await query.answer("Seleziona un dispositivo", show_alert=True)
-      return DEVICE_SELECTIONC
-    context.user_data["device"] = query.data
-
-    await query.edit_message_text(
-      f"Dispositivo selezionato: {query.data}"
-    )
-
-    return NREADINTERVAL
-
-async def salva_nreadinterval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-      valore = int(update.message.text)
-
-      if valore < 0:
-        raise ValueError
-
-      context.user_data["nreadinterval"] = valore
-
-
-      await update.message.reply_text(
-        "Ogni quanti readinterval scrivere dati?"
-      )
-      return NREADPROCESSING
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NREADINTERVAL
-    
-async def salva_nreadprocessing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-      valore = int(update.message.text)
-
-      if valore < 0:
-        raise ValueError
-
-      context.user_data["nreadprocessing"] = valore
-
-
-      await update.message.reply_text(
-        "Acceso o spento?",
-        reply_markup=ReplyKeyboardMarkup(
-          [["Acceso", "Spento"]], one_time_keyboard=True, input_field_placeholder="Acceso o Spento?"
-          )
-      )
-      return NACTIVE
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NREADPROCESSING
-
-async def salva_nactive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        text = update.message.text.strip().lower()
-
-        if text == "acceso":
-            active = True
-        elif text == "spento":
-            active = False
-        else:
-            await update.message.reply_text(
-                "Scegli Acceso o Spento."
-            )
-            return NACTIVE
-        
-        context.user_data["active"] = active
-
-        send_device_config(
-            context.user_data["device"],
-            context.user_data["nreadinterval"],
-            context.user_data["nreadprocessing"],
-            context.user_data["active"])
-        await update.message.reply_text(
-            "Configurazione inviata."
-        )
-
+    name = query.data[len("room_"):]
+    if not room_exists(name):
+        await query.edit_message_text("Stanza non più esistente.")
         return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text(
-            "Inserisci un numero valido maggiore o uguale a 0."
-        )
-        return NACTIVE
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Operazione annullata."
+    context.user_data["room"] = name
+    room = get_room(name)
+    text = (
+        f"Stanza: {name}\n"
+        f"AC totali: {room['num_ac']}\n"
+        f"Dispositivi: {', '.join(room.get('device_ids', [])) or 'nessuno'}"
     )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Rinomina", callback_data="rm_rename"),
+         InlineKeyboardButton("Cambia AC", callback_data="rm_ac")],
+        [InlineKeyboardButton("Assegna dispositivi", callback_data="rm_devices"),
+         InlineKeyboardButton("Elimina stanza", callback_data="rm_delete")],
+        [InlineKeyboardButton("« Indietro", callback_data="rm_back")],
+    ])
+    await query.edit_message_text(text, reply_markup=kb)
+    return RM_MENU
+
+
+async def rooms_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    name = context.user_data.get("room")
+
+    if action == "rm_back":
+        names = get_room_names()
+        await query.edit_message_text("Scegli una stanza:", reply_markup=room_buttons())
+        return RM_PICK
+
+    if action == "rm_rename":
+        await query.message.reply_text("Nuovo nome della stanza?", reply_markup=ForceReply())
+        return RM_RENAME
+
+    if action == "rm_ac":
+        await query.message.reply_text("Quanti condizionatori?", reply_markup=number_keyboard())
+        return RM_AC
+
+    if action == "rm_devices":
+        devices = get_known_devices()
+        assigned = {d: get_device_room(d) for d in devices}
+        existing = set(get_room(name).get("device_ids", []))
+        context.user_data["devices"] = devices
+        context.user_data["assigned"] = assigned
+        context.user_data["selected_devices"] = list(existing)
+        await query.message.reply_text(
+            "Seleziona i dispositivi (quelli attivi sono preselezionati):",
+            reply_markup=device_keyboard(devices, assigned, list(existing)),
+        )
+        return RM_DEVICES
+
+    if action == "rm_delete":
+        await query.edit_message_text(
+            f"Eliminare '{name}'?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Sì", callback_data="rm_del_yes"),
+                 InlineKeyboardButton("No", callback_data="rm_del_no")],
+            ]),
+        )
+        return RM_DELETE
+
+    return RM_MENU
+
+
+async def rooms_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text.strip()
+    old = context.user_data["room"]
+    if not new_name:
+        await update.message.reply_text("Nome non valido.")
+        return RM_RENAME
+    if new_name != old and room_exists(new_name):
+        await update.message.reply_text("Esiste già una stanza con questo nome.")
+        return RM_RENAME
+    room = get_room(old)
+    delete_room(old)
+    add_room(new_name, room.get("device_ids", []), room.get("num_ac", 0))
+    context.user_data["room"] = new_name
+    await update.message.reply_text(f"Rinominata in '{new_name}'.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Comando non riconosciuto. Usa /help."
+
+async def rooms_ac(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        count = int(update.message.text)
+        if count < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return RM_AC
+    update_room(context.user_data["room"], num_ac=count)
+    await update.message.reply_text("Numero AC aggiornato.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+async def rooms_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    selected = context.user_data.setdefault("selected_devices", [])
+    devices = context.user_data["devices"]
+    assigned = context.user_data["assigned"]
+    name = context.user_data["room"]
+
+    if query.data == "done":
+        for dev in selected:
+            remove_device_from_all_rooms(dev, except_room=name)
+        update_room(name, device_ids=selected)
+        await query.edit_message_text(
+            f"Dispositivi di '{name}': {', '.join(selected) if selected else 'nessuno'}"
+        )
+        return ConversationHandler.END
+
+    device = query.data
+    if device in selected:
+        selected.remove(device)
+    else:
+        selected.append(device)
+    await query.edit_message_reply_markup(reply_markup=device_keyboard(devices, assigned, selected))
+    return RM_DEVICES
+
+
+async def rooms_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = context.user_data.get("room")
+    if query.data == "rm_del_yes":
+        delete_room(name)
+        await query.edit_message_text(f"Stanza '{name}' eliminata.")
+    else:
+        await query.edit_message_text("Operazione annullata.")
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /event — record one event (room → people → AC cool → AC heat → validate)
+# ─────────────────────────────────────────────────────────────────────────────
+async def event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    names = get_room_names()
+    if not names:
+        await update.message.reply_text("Nessuna stanza. Creane una con /setup.")
+        return ConversationHandler.END
+    await update.message.reply_text("Seleziona la stanza:", reply_markup=room_buttons(prefix="eroom_"))
+    return EVENT_ROOM
+
+
+async def event_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = query.data[len("eroom_"):]
+    if not room_exists(name):
+        await query.edit_message_text("Stanza non valida.")
+        return ConversationHandler.END
+    context.user_data["room"] = name
+    context.user_data["num_ac"] = get_room(name)["num_ac"]
+    await query.message.reply_text("Quante persone ci sono?", reply_markup=number_keyboard())
+    return EVENT_PEOPLE
+
+
+async def event_people(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if val < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return EVENT_PEOPLE
+    context.user_data["num_people"] = val
+    await update.message.reply_text("Quanti AC freddi (cool)?", reply_markup=number_keyboard())
+    return EVENT_COOL
+
+
+async def event_cool(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if val < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return EVENT_COOL
+    context.user_data["num_ac_cool"] = val
+    await update.message.reply_text("Quanti AC caldi (heat)?", reply_markup=number_keyboard())
+    return EVENT_HEAT
+
+
+async def event_heat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        heat = int(update.message.text)
+        if heat < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return EVENT_HEAT
+
+    room = context.user_data["room"]
+    num_ac = context.user_data["num_ac"]
+    cool = context.user_data["num_ac_cool"]
+    if cool + heat > num_ac:
+        await update.message.reply_text(
+            f"Cool({cool}) + Heat({heat}) = {cool + heat} > AC totali ({num_ac}). Riprova.",
+            reply_markup=number_keyboard(),
+        )
+        return EVENT_HEAT
+
+    device_ids = get_room(room).get("device_ids", [])
+    append_action(
+        datetime.now(timezone.utc).isoformat(),
+        room, num_ac, context.user_data["num_people"], cool, heat, device_ids,
     )
+    off = num_ac - cool - heat
+    await update.message.reply_text(
+        f"✅ Evento registrato.\n{room}: persone {context.user_data['num_people']} | "
+        f"AC {cool}C / {heat}H / {off}F",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /events — list with pagination, edit & delete
+# ─────────────────────────────────────────────────────────────────────────────
+def _events_page_rows(page=0):
+    rows = read_actions()
+    total = len(rows)
+    start = page * EVENTS_PER_PAGE
+    page_rows = rows[start:start + EVENTS_PER_PAGE]
+    return page_rows, total, page
+
+
+def _render_events(update_text_target, page_rows, total, page):
+    lines = []
+    base = page * EVENTS_PER_PAGE
+    for i, r in enumerate(page_rows):
+        idx = base + i
+        lines.append(
+            f"[{idx}] {_fmt_time(r.get('timestamp'))} | {r.get('room')} | "
+            f"persone {r.get('num_people')} | AC {r.get('num_ac_cool')}C/"
+            f"{r.get('num_ac_heat')}H/{r.get('num_ac_off')}F"
+        )
+    header = f"Eventi ({total} totali):\n\n" + ("\n".join(lines) if lines else "(nessuno)")
+    return header
+
+
+def _events_nav_keyboard(page, total):
+    last_page = max(0, (total - 1) // EVENTS_PER_PAGE) if total else 0
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Prec", callback_data=f"ev_pg_{page - 1}"))
+    if page < last_page:
+        nav.append(InlineKeyboardButton("Succ »", callback_data=f"ev_pg_{page + 1}"))
+    rows = [nav] if nav else []
+    base = page * EVENTS_PER_PAGE
+    for i, _ in enumerate(_events_page_rows(page)[0]):
+        idx = base + i
+        rows.append([
+            InlineKeyboardButton("Modifica", callback_data=f"ev_edit_{idx}"),
+            InlineKeyboardButton("Elimina", callback_data=f"ev_del_{idx}"),
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def events_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _events_render(update, context, page=0, edit=False)
+
+
+async def _events_render(update, context, page, edit):
+    page_rows, total, page = _events_page_rows(page)
+    text = _render_events(None, page_rows, total, page)
+    kb = _events_nav_keyboard(page, total)
+    if not page_rows:
+        kb = None
+    context.user_data["page"] = page
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
+    return EV_PAGE
+
+
+async def events_page_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    if data.startswith("ev_pg_"):
+        return await _events_render(update, context, int(data[len("ev_pg_"):]), edit=False)
+    await query.answer()
+    if data.startswith("ev_del_"):
+        idx = int(data[len("ev_del_"):])
+        context.user_data["del_idx"] = idx
+        await query.edit_message_text(
+            "Confermi l'eliminazione?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Sì", callback_data="ev_delc_yes"),
+                 InlineKeyboardButton("No", callback_data="ev_delc_no")],
+            ]),
+        )
+        return EV_PAGE
+    if data == "ev_delc_yes":
+        delete_action_row(context.user_data.pop("del_idx", -1))
+        await query.edit_message_text("Riga eliminata.")
+        return await _events_render(update, context, context.user_data.get("page", 0), edit=False)
+    if data == "ev_delc_no":
+        return await _events_render(update, context, context.user_data.get("page", 0), edit=False)
+    if data.startswith("ev_edit_"):
+        idx = int(data[len("ev_edit_"):])
+        rows = read_actions()
+        if not (0 <= idx < len(rows)):
+            await query.edit_message_text("Riga non valida.")
+            return ConversationHandler.END
+        context.user_data["edit_idx"] = idx
+        context.user_data["num_ac"] = int(rows[idx].get("num_ac", 0))
+        await query.message.reply_text("Nuovo numero persone?", reply_markup=number_keyboard())
+        return EV_EDIT_PEOPLE
+    return EV_PAGE
+
+
+async def events_edit_people(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if val < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return EV_EDIT_PEOPLE
+    context.user_data["num_people"] = val
+    await update.message.reply_text("Nuovi AC freddi (cool)?", reply_markup=number_keyboard())
+    return EV_EDIT_COOL
+
+
+async def events_edit_cool(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if val < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return EV_EDIT_COOL
+    context.user_data["num_ac_cool"] = val
+    await update.message.reply_text("Nuovi AC caldi (heat)?", reply_markup=number_keyboard())
+    return EV_EDIT_HEAT
+
+
+async def events_edit_heat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        heat = int(update.message.text)
+        if heat < 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido.", reply_markup=number_keyboard())
+        return EV_EDIT_HEAT
+    num_ac = context.user_data["num_ac"]
+    cool = context.user_data["num_ac_cool"]
+    if cool + heat > num_ac:
+        await update.message.reply_text(
+            f"Cool({cool}) + Heat({heat}) > AC totali ({num_ac}).", reply_markup=number_keyboard()
+        )
+        return EV_EDIT_HEAT
+    off = num_ac - cool - heat
+    update_action_row(
+        context.user_data["edit_idx"],
+        num_people=context.user_data["num_people"],
+        num_ac_cool=cool, num_ac_heat=heat, num_ac_off=off,
+    )
+    await update.message.reply_text("✅ Riga aggiornata.", reply_markup=ReplyKeyboardRemove())
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /devices — list ESP32s + push config
+# ─────────────────────────────────────────────────────────────────────────────
+async def devices_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    devices = get_known_devices()
+    if not devices:
+        await update.message.reply_text("Nessun dispositivo rilevato sui bus MQTT.")
+        return ConversationHandler.END
+    now = time.time()
+    lines = []
+    rows = []
+    for dev in devices:
+        room = get_device_room(dev) or "—"
+        age = int(now - known_devices.get(dev, now))
+        lines.append(f"• {dev} | stanza: {room} | ultimo segnale: {age}s fa")
+        rows.append([InlineKeyboardButton(f"Configura {dev}", callback_data=f"devcfg_{dev}")])
+    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+    return DEV_SELECT
+
+
+async def devices_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    dev = query.data[len("devcfg_"):]
+    context.user_data["device"] = dev
+    await query.message.reply_text("read_interval (secondi)?", reply_markup=number_keyboard())
+    return DEV_INTERVAL
+
+
+async def devices_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if val <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido (> 0).", reply_markup=number_keyboard())
+        return DEV_INTERVAL
+    context.user_data["read_interval"] = val
+    await update.message.reply_text("read_processing (numero di letture)?", reply_markup=number_keyboard())
+    return DEV_PROCESSING
+
+
+async def devices_processing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text)
+        if val <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        await update.message.reply_text("Numero non valido (> 0).", reply_markup=number_keyboard())
+        return DEV_PROCESSING
+    context.user_data["read_processing"] = val
+    await update.message.reply_text(
+        "Attivo?",
+        reply_markup=ReplyKeyboardMarkup(
+            [["Acceso", "Spento"]], resize_keyboard=True, one_time_keyboard=True,
+            input_field_placeholder="Acceso o Spento?",
+        ),
+    )
+    return DEV_ACTIVE
+
+
+async def devices_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+    if text == "acceso":
+        active = True
+    elif text == "spento":
+        active = False
+    else:
+        await update.message.reply_text("Scegli Acceso o Spento.")
+        return DEV_ACTIVE
+    send_device_config(
+        context.user_data["device"],
+        context.user_data["read_interval"],
+        context.user_data["read_processing"],
+        active,
+    )
+    await update.message.reply_text(
+        f"✅ Configurazione inviata a {context.user_data['device']}.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /show, /sensors, /actions, /config — read-only views & downloads
+# ─────────────────────────────────────────────────────────────────────────────
+def _merge_rows(room_filter=None, limit=10):
+    sensors = read_sensors()
+    actions = read_actions()
+    rows = []
+    for r in sensors:
+        if room_filter and r.get("room") != room_filter:
+            continue
+        r["_source"] = "sensor"
+        rows.append(r)
+    for r in actions:
+        if room_filter and r.get("room") != room_filter:
+            continue
+        r["_source"] = "action"
+        rows.append(r)
+    rows.sort(key=lambda r: _parse_ts(r.get("timestamp")), reverse=True)
+    return rows[:limit]
+
+
+def _format_merged(rows):
+    out = []
+    for r in rows:
+        t = _fmt_time(r.get("timestamp"))
+        room = r.get("room", "")
+        if r["_source"] == "sensor":
+            out.append(f"{t} | {room} | {r.get('device_id')} | {r.get('type')}: "
+                       f"media {r.get('media')} (min {r.get('min')}, max {r.get('max')})")
+        else:
+            out.append(f"{t} | {room} | persone {r.get('num_people')} | "
+                       f"AC {r.get('num_ac_cool')}C/{r.get('num_ac_heat')}H/{r.get('num_ac_off')}F")
+    return "\n".join(out) if out else "(nessun dato)"
+
+
+async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = [[InlineKeyboardButton("Tutte le stanze", callback_data="show_all")]]
+    for name in get_room_names():
+        rows.append([InlineKeyboardButton(name, callback_data=f"show_room_{name}")])
+    await update.message.reply_text("Mostra dati (ultimi 10):", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def sensors_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = [[InlineKeyboardButton("Export completo", callback_data="sensors_all")]]
+    for name in get_room_names():
+        rows.append([InlineKeyboardButton(name, callback_data=f"sensors_room_{name}")])
+    await update.message.reply_text("Scarica sensors:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def actions_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = [[InlineKeyboardButton("Export completo", callback_data="actions_all")]]
+    for name in get_room_names():
+        rows.append([InlineKeyboardButton(name, callback_data=f"actions_room_{name}")])
+    await update.message.reply_text("Scarica actions:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def config_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = [[InlineKeyboardButton("Tutte le stanze", callback_data="config_all")]]
+    for name in get_room_names():
+        rows.append([InlineKeyboardButton(name, callback_data=f"config_room_{name}")])
+    await update.message.reply_text("Scarica configurazione:", reply_markup=InlineKeyboardMarkup(rows))
+
+
+def _csv_filtered_bytes(path, room):
+    if not path.exists():
+        return None, None
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = [r for r in reader if (room is None or r.get("room") == room)]
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=fieldnames or [])
+    writer.writeheader()
+    writer.writerows(rows)
+    return io.BytesIO(out.getvalue().encode()), len(rows)
+
+
+async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Global handler for /show, /sensors, /actions, /config inline choices."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    # /show
+    if data == "show_all":
+        await query.message.reply_text(_format_merged(_merge_rows(None)))
+        return
+    if data.startswith("show_room_"):
+        await query.message.reply_text(_format_merged(_merge_rows(data[len("show_room_"):])))
+
+    # /sensors
+    elif data == "sensors_all":
+        path = DATA_DIR / "sensors.csv"
+        if path.exists() and path.stat().st_size:
+            await query.message.reply_document(document=open(path, "rb"), filename="sensors.csv")
+        else:
+            await query.message.reply_text("sensors.csv vuoto o assente.")
+    elif data.startswith("sensors_room_"):
+        room = data[len("sensors_room_"):]
+        bio, n = _csv_filtered_bytes(DATA_DIR / "sensors.csv", room)
+        if bio is None:
+            await query.message.reply_text("sensors.csv assente.")
+        else:
+            await query.message.reply_document(document=bio, filename=f"sensors_{room}.csv")
+
+    # /actions
+    elif data == "actions_all":
+        path = DATA_DIR / "actions.csv"
+        if path.exists() and path.stat().st_size:
+            await query.message.reply_document(document=open(path, "rb"), filename="actions.csv")
+        else:
+            await query.message.reply_text("actions.csv vuoto o assente.")
+    elif data.startswith("actions_room_"):
+        room = data[len("actions_room_"):]
+        bio, n = _csv_filtered_bytes(DATA_DIR / "actions.csv", room)
+        if bio is None:
+            await query.message.reply_text("actions.csv assente.")
+        else:
+            await query.message.reply_document(document=bio, filename=f"actions_{room}.csv")
+
+    # /config
+    elif data == "config_all":
+        path = DATA_DIR / "rooms.json"
+        if path.exists() and path.stat().st_size:
+            await query.message.reply_document(document=open(path, "rb"), filename="rooms.json")
+        else:
+            await query.message.reply_text("rooms.json vuoto o assente.")
+    elif data.startswith("config_room_"):
+        room = data[len("config_room_"):]
+        room_cfg = get_room(room)
+        if room_cfg is None:
+            await query.message.reply_text("Stanza non trovata.")
+        else:
+            text = json.dumps({room: room_cfg}, indent=2, ensure_ascii=False)
+            await query.message.reply_document(
+                document=io.BytesIO(text.encode()), filename=f"{room}_config.json"
+            )
+
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Comando non riconosciuto. Usa /help.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bootstrap
+# ─────────────────────────────────────────────────────────────────────────────
+async def post_init(application: Application):
+    """Register the bot menu and bring up the MQTT discovery client."""
+    await application.bot.set_my_commands([
+        BotCommand("setup", "Crea una nuova stanza"),
+        BotCommand("rooms", "Gestisci le stanze"),
+        BotCommand("event", "Registra evento (persone/AC)"),
+        BotCommand("events", "Modifica o elimina eventi recenti"),
+        BotCommand("devices", "Configura i sensori ESP32"),
+        BotCommand("show", "Mostra dati sensori ed eventi"),
+        BotCommand("sensors", "Scarica dati sensori"),
+        BotCommand("actions", "Scarica dati eventi"),
+        BotCommand("config", "Scarica configurazione stanze"),
+        BotCommand("cancel", "Annulla operazione"),
+    ])
+    global mqtt_client
+    try:
+        mqtt_client = connect_mqtt()
+        mqtt_client.on_message = _on_mqtt_message
+        mqtt_client.subscribe("sensor/+/+")
+        mqtt_client.subscribe("discovery/devices")
+        mqtt_client.loop_start()
+        logger.info("MQTT discovery client started.")
+    except Exception as e:
+        logger.warning("MQTT unavailable (%s); device features disabilitate.", e)
+
+
+def _build_application():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit(
+            "ERROR: TELEGRAM_BOT_TOKEN not set. Copy .env.example to .env and fill in your bot token."
+        )
+    app = Application.builder().token(token).post_init(post_init).build()
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("setup", setup_start)],
+        states={
+            ROOM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_room_name)],
+            AC_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_ac_count)],
+            DEVICE_SELECTION: [CallbackQueryHandler(save_devices)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("rooms", rooms_list)],
+        states={
+            RM_PICK: [CallbackQueryHandler(rooms_show_menu, pattern="^room_")],
+            RM_MENU: [CallbackQueryHandler(rooms_menu_action, pattern="^rm_")],
+            RM_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rooms_rename)],
+            RM_AC: [MessageHandler(filters.TEXT & ~filters.COMMAND, rooms_ac)],
+            RM_DEVICES: [CallbackQueryHandler(rooms_devices)],
+            RM_DELETE: [CallbackQueryHandler(rooms_delete, pattern="^rm_del")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("event", event_start)],
+        states={
+            EVENT_ROOM: [CallbackQueryHandler(event_room, pattern="^eroom_")],
+            EVENT_PEOPLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_people)],
+            EVENT_COOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_cool)],
+            EVENT_HEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_heat)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("events", events_start)],
+        states={
+            EV_PAGE: [CallbackQueryHandler(events_page_action, pattern="^ev_")],
+            EV_EDIT_PEOPLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, events_edit_people)],
+            EV_EDIT_COOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, events_edit_cool)],
+            EV_EDIT_HEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, events_edit_heat)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("devices", devices_start)],
+        states={
+            DEV_SELECT: [CallbackQueryHandler(devices_pick, pattern="^devcfg_")],
+            DEV_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, devices_interval)],
+            DEV_PROCESSING: [MessageHandler(filters.TEXT & ~filters.COMMAND, devices_processing)],
+            DEV_ACTIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, devices_active)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    ))
+
+    # Read-only views & downloads (no text state → plain handlers + global callback).
+    app.add_handler(CommandHandler("show", show_start))
+    app.add_handler(CommandHandler("sensors", sensors_download))
+    app.add_handler(CommandHandler("actions", actions_download))
+    app.add_handler(CommandHandler("config", config_download))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(
+        downloads_callback,
+        pattern="^(show|sensors|actions|config)_",
+    ))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    return app
 
 
 def main():
-    # Read token from environment — set TELEGRAM_BOT_TOKEN in .env
-    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not TOKEN:
-        raise SystemExit("ERROR: TELEGRAM_BOT_TOKEN not set. Copy .env.example to .env and fill in your bot token.")
+    app = _build_application()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    application = Application.builder().token(TOKEN).build()
-
-    conv_handler_stanza = ConversationHandler(
-        entry_points=[
-            CommandHandler("setup", setup_start)
-        ],
-        states={
-            ROOM_NAME: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    save_room_name
-                )
-            ],
-            NCOND: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    save_ac_count
-                )
-            ],
-            DEVICE_SELECTION: [
-                CallbackQueryHandler(
-                    save_devices
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-    )
-
-    conv_handler_persone = ConversationHandler(
-        entry_points=[
-            CommandHandler("npersone", npersone)
-        ],
-        states={
-            STANZAP: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_stanzap
-                )
-            ],
-            NPERSONE: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_npersone
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-    )
-
-    conv_handler_condizionatori = ConversationHandler(
-        entry_points=[
-            CommandHandler("ncondizionatori", ncondizionatori)
-        ],
-        states={
-            STANZAC: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_stanzac
-                )
-            ],
-            NCONDFREDDI: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_ncondfreddi
-                )
-            ],
-            NCONDCALDI: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_ncondcaldi
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-    )
-
-    conv_handler_clearline = ConversationHandler(
-        entry_points=[
-            CommandHandler("clearline", clearline)
-        ],
-        states={
-            STANZACLEAR: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_clearline
-                )
-            ]
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-    )
-    conv_handler_deleteroom = ConversationHandler(
-        entry_points=[
-            CommandHandler("deleteroom", deleteroom)
-        ],
-        states={
-            DELETEROOM: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_deleteroom
-                )
-            ]
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-    )
-    conv_handler_config = ConversationHandler(
-        entry_points=[
-            CommandHandler("config", config)
-        ],
-        states={
-            DEVICE_SELECTIONC: [
-                CallbackQueryHandler(salva_device)
-            ],
-            NREADINTERVAL: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_nreadinterval
-                )
-            ],
-            NREADPROCESSING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_nreadprocessing
-                )
-            ],
-            NACTIVE: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    salva_nactive
-                )
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel)
-        ],
-    )
-    
-
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("rooms", rooms_list))
-    application.add_handler(CommandHandler("sensorsdownload", sensors_download))
-    application.add_handler(CommandHandler("actionsdownload", actions_download))
-    application.add_handler(CommandHandler("roomsdownload", rooms_download))
-    application.add_handler(conv_handler_stanza)
-    application.add_handler(conv_handler_persone)
-    application.add_handler(conv_handler_condizionatori)
-    application.add_handler(conv_handler_clearline)
-    application.add_handler(conv_handler_deleteroom)
-    application.add_handler(conv_handler_config)
-
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()

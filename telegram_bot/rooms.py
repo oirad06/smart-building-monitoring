@@ -70,3 +70,18 @@ def get_device_room(device_id):
         if device_id in config.get("device_ids", []):
             return name
     return None
+
+def remove_device_from_all_rooms(device_id, except_room=None):
+    """Remove a device from every room's device_ids (except `except_room`). Returns names of rooms that changed."""
+    rooms = _load_rooms()
+    changed = []
+    for name, config in rooms.items():
+        if name == except_room:
+            continue
+        ids = config.get("device_ids", [])
+        if device_id in ids:
+            config["device_ids"] = [d for d in ids if d != device_id]
+            changed.append(name)
+    if changed:
+        _save_rooms(rooms)
+    return changed

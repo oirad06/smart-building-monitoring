@@ -3,7 +3,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-DATA_DIR = Path("../data")
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 ACTIONS_FILE = DATA_DIR / "actions.csv"
 
 def append_action(timestamp, room, num_ac, num_people, num_ac_cool, num_ac_heat, device_ids):

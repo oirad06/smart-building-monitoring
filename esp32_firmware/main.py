@@ -10,9 +10,9 @@ from umqttsimple import MQTTClient
 import ubinascii
 
 try:
-    from secrets import mqtt_server, mqtt_port, mqtt_user, mqtt_pass
+    from secrets import wifi_ssid, wifi_password, mqtt_server, mqtt_port, mqtt_user, mqtt_pass
 except ImportError:
-    raise SystemExit("ERROR: esp32_firmware/secrets.py not found. Copy secrets.py.example to secrets.py and configure your MQTT credentials.")
+    raise SystemExit("ERROR: esp32_firmware/secrets.py not found. Copy secrets.py.example to secrets.py and configure WiFi + MQTT credentials.")
 
 tempVal = []
 humVal = []
@@ -39,19 +39,20 @@ def do_connect():
     wlan.active(True)
     if not wlan.isconnected():
         print('connecting to network...')
-        wlan.connect('prismlab_guest', 'guest-123-prismlab')
+        wlan.connect(wifi_ssid, wifi_password)
         while not wlan.isconnected():
             machine.idle()
     print('network config:', wlan.ipconfig('addr4'))
 
 #configuration
 def sub_cb(topic, msg):
-  global READ_INTERVAL, READ_PROCESSING, ACTIVE
+  global READ_INTERVAL, READ_PROCESSING, ACTIVE, Contatore
   if msg != None:
       config = json.loads(msg)
-      READ_INTERVAL = int(config["readI"])
-      READ_PROCESSING = int(config["readP"])
-      ACTIVE = bool(config["activate"])
+      READ_INTERVAL = int(config["read_interval"])
+      READ_PROCESSING = int(config["read_processing"])
+      ACTIVE = bool(config["active"])
+      Contatore = READ_PROCESSING // READ_INTERVAL
       print("config: ", config)
       print("actual config: ", READ_INTERVAL, READ_PROCESSING, ACTIVE)
 
@@ -63,14 +64,8 @@ client.subscribe(b"sensor/" + device_id.encode() + b"/config")
 
 #Superloop
 while True:
-  #configuration
-  msg = client.check_msg()
-  if msg != None:
-    config = json.loads(msg)
-    READ_INTERVAL = int(config["readI"])
-    READ_PROCESSING = int(config["readP"])
-    ACTIVE = bool(config["activate"])
-    Contatore = READ_PROCESSING // READ_INTERVAL
+  # Poll for config messages; sub_cb applies them and rescales Contatore.
+  client.check_msg()
 
 
   if ACTIVE != True:
@@ -158,7 +153,7 @@ while True:
       json_datahum = json.dumps(datahum)
       print(json_datatemp)
       print(json_datahum)
-      client.publish(b"sensor/" + device_id.encode() + b"/temperature", json_datatemp)
-      client.publish(b"sensor/" + device_id.encode() + b"/humidity", json_datahum)
+      client.publish(b"sensor/" + device_id.encode() + b"/temperature", json_datatemp.encode())
+      client.publish(b"sensor/" + device_id.encode() + b"/humidity", json_datahum.encode())
 
   time.sleep(READ_INTERVAL)

@@ -1,15 +1,26 @@
 # Telegram Bot
 
-Conversational bot for managing room-based sensor configurations via Telegram.
+Bot for managing rooms, recording events, configuring ESP32 devices, and
+downloading data. Talks to MQTT directly (own connection) and reads/writes the
+shared `data/` folder.
 
-## Features
+## Commands
 
-- `/setup` — register a new room (name, AC unit count, CSV file path)
-- `/npersone` — set occupant count for a room
-- `/ncondizionatori` — set AC unit counts (hot/cold) for a room
-- `/deleteroom` — remove a room and its data
-- `/clearline` — delete the last CSV row for a room
-- `/help` — list all commands
+| Command | Description |
+|---|---|
+| `/setup` | Create a new room (name → AC count → assign devices) |
+| `/rooms` | Manage a room: rename, change AC, reassign devices, delete |
+| `/event` | Record an event (room → people → AC cool → AC heat); one row per event |
+| `/events` | Browse/edit/delete recent events with pagination |
+| `/devices` | List known ESP32s and push runtime config (interval, window, active) |
+| `/show` | Merged view of sensor + event data (last 10), filterable by room |
+| `/sensors` | Download `sensors.csv` (full export or per room) |
+| `/actions` | Download `actions.csv` (full export or per room) |
+| `/config` | Download `rooms.json` (all rooms or single room) |
+| `/cancel` | Abort any in-progress conversation |
+
+A `/cancel` fallback is wired into every conversation. The bot menu is
+registered automatically via `set_my_commands`.
 
 ## Setup
 
@@ -17,7 +28,9 @@ Conversational bot for managing room-based sensor configurations via Telegram.
 pip install -r requirements.txt
 ```
 
-Create a `.env` file in this directory (copy from `.env.example`) and set `TELEGRAM_BOT_TOKEN` to your bot token from [@BotFather](https://t.me/BotFather). The bot will exit with an error if the token is not set.
+Create `.env` (copy from `.env.example`) with `TELEGRAM_BOT_TOKEN`,
+`MQTT_BROKER`, `MQTT_PORT`, `MQTT_USER`, `MQTT_PASS`. The bot exits with an
+error if the token or MQTT credentials are missing.
 
 ```bash
 python bot.py
@@ -25,6 +38,19 @@ python bot.py
 
 ## Data
 
-- Room registry stored in `data/stanze.json`
-- Per-room CSV files stored in `data/`
-- See `data/` for persisted readings
+- `data/rooms.json` — room registry (bot writes, consumer reads)
+- `data/actions.csv` — manual events (bot writes)
+- `data/sensors.csv` — sensor readings (consumer writes)
+
+CSVs are self-contained: English headers, a `room` column, and `device_ids`
+present so they can be joined without `rooms.json`.
+
+## MQTT
+
+The bot subscribes to `sensor/+/+` and `discovery/devices` to learn which ESP32s
+are online, and publishes device config directly to
+`sensor/{device_id}/config`:
+
+```json
+{ "read_interval": 1, "read_processing": 10, "active": true }
+```

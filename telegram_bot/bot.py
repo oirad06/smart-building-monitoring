@@ -209,7 +209,8 @@ def read_sensors():
 # ─────────────────────────────────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Benvenuto in Smart Building Monitor. Usa /help per la lista comandi."
+        "Benvenuto in Smart Building Monitor. Usa /help per la lista comandi.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -225,7 +226,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sensors — scarica sensors.csv\n"
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
-        "/cancel — annulla l'operazione in corso"
+        "/cancel — annulla l'operazione in corso",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 

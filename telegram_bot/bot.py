@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import time
+import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +44,18 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+)
+from telegram.warnings import PTBUserWarning
+
+# Every ConversationHandler below mixes MessageHandler text states with
+# CallbackQueryHandler states under the default per_message=False. That mix is
+# intentional (per_message=True is invalid here — it requires all handlers to be
+# CallbackQueryHandler), so PTB's per_message advisory is a benign false positive.
+# Silence just that one message; keep all other PTBUserWarnings visible.
+warnings.filterwarnings(
+    "ignore",
+    message="If 'per_message=False', 'CallbackQueryHandler' will not be",
+    category=PTBUserWarning,
 )
 
 load_dotenv()

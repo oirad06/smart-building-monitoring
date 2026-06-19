@@ -58,18 +58,26 @@ def on_message(client, userdata, msg):
         print(f"Bad payload: {e}")
         return
 
-    measurement = data["measurement"]
     # topic looks like "sensor/{device_id}/temperature"
     parts = msg.topic.split("/")
     device_id = parts[1]          # always the second part
     measurement_type = parts[2]   # "temperature" or "humidity"
 
+    try:
+        measurement = data["measurement"]
+        row_vals = (
+            measurement["min"], measurement["max"],
+            measurement["media"], measurement["varianza"],
+        )
+    except (KeyError, TypeError) as e:
+        print(f"Skipping malformed sensor payload on {msg.topic}: missing {e}")
+        return
+
     room = get_room_for_device(device_id)
     append_sensor_row(
         datetime.now(timezone.utc).isoformat(),
         device_id, room, measurement_type,
-        measurement["min"], measurement["max"],
-        measurement["media"], measurement["varianza"],
+        *row_vals,
     )
     print("row appended")
 

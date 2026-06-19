@@ -90,7 +90,7 @@ def sub_cb(topic, msg):
 
 
 def connect_mqtt():
-    client = MQTTClient(device_id, mqtt_server, mqtt_port, user=mqtt_user, password=mqtt_pass)
+    client = MQTTClient(device_id.encode(), mqtt_server, mqtt_port, user=mqtt_user, password=mqtt_pass)
     client.set_callback(sub_cb)
     client.connect()
     client.subscribe(CONFIG_TOPIC)

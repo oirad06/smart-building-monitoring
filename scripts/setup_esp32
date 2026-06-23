@@ -11,12 +11,41 @@ Defaults:
   board: esp32
 
 Environment:
-  ESP32_PORT=/dev/ttyUSB0  Serial port to flash (default: /dev/ttyUSB0)
+  ESP32_PORT=/dev/ttyUSB0  Optional serial port override. When unset, the
+                           script auto-detects one /dev/ttyUSB* or /dev/ttyACM*.
 USAGE
 }
 
+detect_port() {
+    local line port
+    local ports=()
+
+    while IFS= read -r line; do
+        port="${line%% *}"
+        case "$port" in
+            /dev/ttyUSB*|/dev/ttyACM*)
+                ports+=("$port")
+                ;;
+        esac
+    done < <(mpremote connect list)
+
+    case "${#ports[@]}" in
+        0)
+            echo "No ESP32 serial port detected. Connect a board or set ESP32_PORT=/dev/ttyUSBx." >&2
+            exit 1
+            ;;
+        1)
+            printf '%s\n' "${ports[0]}"
+            ;;
+        *)
+            echo "Multiple ESP32 serial ports detected: ${ports[*]}" >&2
+            echo "Set ESP32_PORT=/dev/ttyUSBx to choose one." >&2
+            exit 1
+            ;;
+    esac
+}
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PORT="${ESP32_PORT:-/dev/ttyUSB0}"
 SENSOR="dht11"
 BOARD="esp32"
 
@@ -51,6 +80,12 @@ while (($#)); do
             ;;
     esac
 done
+
+if [[ -n "${ESP32_PORT:-}" ]]; then
+    PORT="$ESP32_PORT"
+else
+    PORT="$(detect_port)"
+fi
 
 case "$SENSOR" in
     dht11|dht22)

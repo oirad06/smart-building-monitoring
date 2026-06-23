@@ -9,26 +9,41 @@ SCRIPT = ROOT / "scripts" / "setup_esp32"
 
 
 class SetupEsp32ScriptTest(unittest.TestCase):
-    def run_setup(self, *args):
+    def run_setup(self, *args, env_port="/dev/testUSB", mpremote_list=None):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             log = tmp_path / "commands.log"
             fakebin = tmp_path / "bin"
             fakebin.mkdir()
 
-            for name in ("esptool", "mpremote"):
-                tool = fakebin / name
-                tool.write_text(
-                    "#!/usr/bin/env bash\n"
-                    f"printf '%s ' {name!r} >> {str(log)!r}\n"
-                    f"printf '%q ' \"$@\" >> {str(log)!r}\n"
-                    f"printf '\\n' >> {str(log)!r}\n"
-                )
-                tool.chmod(0o755)
+            esptool = fakebin / "esptool"
+            esptool.write_text(
+                "#!/usr/bin/env bash\n"
+                f"printf '%s ' 'esptool' >> {str(log)!r}\n"
+                f"printf '%q ' \"$@\" >> {str(log)!r}\n"
+                f"printf '\\n' >> {str(log)!r}\n"
+            )
+            esptool.chmod(0o755)
+
+            mpremote = fakebin / "mpremote"
+            mpremote.write_text(
+                "#!/usr/bin/env bash\n"
+                "if [[ \"$1\" == 'connect' && \"$2\" == 'list' ]]; then\n"
+                f"  printf '%b\\n' {((mpremote_list if mpremote_list is not None else '/dev/autoUSB 0001 10c4:ea60 Silicon Labs CP2102 USB to UART Bridge Controller'))!r}\n"
+                "  exit 0\n"
+                "fi\n"
+                f"printf '%s ' 'mpremote' >> {str(log)!r}\n"
+                f"printf '%q ' \"$@\" >> {str(log)!r}\n"
+                f"printf '\\n' >> {str(log)!r}\n"
+            )
+            mpremote.chmod(0o755)
 
             env = os.environ.copy()
             env["PATH"] = str(fakebin) + os.pathsep + env["PATH"]
-            env["ESP32_PORT"] = "/dev/testUSB"
+            if env_port is None:
+                env.pop("ESP32_PORT", None)
+            else:
+                env["ESP32_PORT"] = env_port
             result = subprocess.run(
                 [str(SCRIPT), *args],
                 cwd=ROOT,
@@ -73,6 +88,41 @@ class SetupEsp32ScriptTest(unittest.TestCase):
             + " :main.py",
             log,
         )
+
+    def test_help_does_not_require_detected_port(self):
+        result, log = self.run_setup("--help", env_port=None, mpremote_list="")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Usage: scripts/setup_esp32", result.stderr)
+        self.assertEqual(log, "")
+
+    def test_auto_detects_single_serial_port_when_env_missing(self):
+        result, log = self.run_setup(
+            env_port=None,
+            mpremote_list="/dev/ttyUSB7 0001 10c4:ea60 Silicon Labs CP2102 USB to UART Bridge Controller",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("esptool --chip esp32 --port /dev/ttyUSB7 erase-flash", log)
+        self.assertIn("mpremote connect /dev/ttyUSB7 sleep 5", log)
+
+    def test_auto_detect_rejects_no_serial_ports(self):
+        result, _ = self.run_setup(env_port=None, mpremote_list="")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("No ESP32 serial port detected", result.stderr)
+
+    def test_auto_detect_rejects_multiple_serial_ports(self):
+        result, _ = self.run_setup(
+            env_port=None,
+            mpremote_list=(
+                "/dev/ttyUSB0 0001 10c4:ea60 Silicon Labs CP2102 USB to UART Bridge Controller\n"
+                "/dev/ttyUSB1 0002 10c4:ea60 Silicon Labs CP2102 USB to UART Bridge Controller"
+            ),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Multiple ESP32 serial ports detected", result.stderr)
 
     def test_short_flags_select_sensor_and_board(self):
         result, log = self.run_setup("-s", "dht22", "-b", "esp32s3")

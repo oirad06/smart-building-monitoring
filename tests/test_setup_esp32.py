@@ -44,6 +44,7 @@ class SetupEsp32ScriptTest(unittest.TestCase):
                 env.pop("ESP32_PORT", None)
             else:
                 env["ESP32_PORT"] = env_port
+            env["SETUP_ESP32_POST_FLASH_WAIT"] = "0"
             result = subprocess.run(
                 [str(SCRIPT), *args],
                 cwd=ROOT,
@@ -65,11 +66,12 @@ class SetupEsp32ScriptTest(unittest.TestCase):
             log,
         )
         self.assertIn(
-            "mpremote connect /dev/testUSB sleep 5 cp "
+            "mpremote connect /dev/testUSB cp "
             + str(ROOT / "esp32_firmware" / "main_dht11.py")
             + " :main.py",
             log,
         )
+        self.assertNotIn("mpremote connect /dev/testUSB sleep", log)
 
     def test_dht22_on_esp32s3_uses_s3_firmware_and_offset(self):
         result, log = self.run_setup("--sensor", "dht22", "--board", "esp32s3")
@@ -83,11 +85,12 @@ class SetupEsp32ScriptTest(unittest.TestCase):
             log,
         )
         self.assertIn(
-            "mpremote connect /dev/testUSB sleep 5 cp "
+            "mpremote connect /dev/testUSB cp "
             + str(ROOT / "esp32_firmware" / "main_dht22.py")
             + " :main.py",
             log,
         )
+        self.assertNotIn("mpremote connect /dev/testUSB sleep", log)
 
     def test_help_does_not_require_detected_port(self):
         result, log = self.run_setup("--help", env_port=None, mpremote_list="")
@@ -104,7 +107,7 @@ class SetupEsp32ScriptTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("esptool --chip esp32 --port /dev/ttyUSB7 erase-flash", log)
-        self.assertIn("mpremote connect /dev/ttyUSB7 sleep 5", log)
+        self.assertIn("mpremote connect /dev/ttyUSB7 cp", log)
 
     def test_auto_detect_rejects_no_serial_ports(self):
         result, _ = self.run_setup(env_port=None, mpremote_list="")

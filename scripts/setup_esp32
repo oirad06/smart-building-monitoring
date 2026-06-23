@@ -83,8 +83,10 @@ done
 
 if [[ -n "${ESP32_PORT:-}" ]]; then
     PORT="$ESP32_PORT"
+    PORT_EXPLICIT=1
 else
     PORT="$(detect_port)"
+    PORT_EXPLICIT=0
 fi
 
 case "$SENSOR" in
@@ -128,10 +130,24 @@ echo "Flashing $BOARD ($CHIP) with $SENSOR firmware on $PORT"
 esptool --chip "$CHIP" --port "$PORT" erase-flash
 esptool --chip "$CHIP" --port "$PORT" --baud 460800 write-flash "$FLASH_OFFSET" "$FIRMWARE_PATH"
 
-# A freshly erased board formats the filesystem and prints a first-boot banner.
-# Give it time to settle before mpremote enters raw REPL, then copy files to the
-# MicroPython filesystem root where main.py imports secrets.py/umqttsimple.py.
-mpremote connect "$PORT" sleep 5 \
+# Native-USB boards (notably ESP32-S3 USB-Serial/JTAG) can disconnect and
+# re-enumerate after esptool resets them. Wait before opening mpremote; opening
+# first and then sleeping leaves mpremote holding a dead file descriptor.
+POST_FLASH_WAIT="${SETUP_ESP32_POST_FLASH_WAIT:-5}"
+if [[ "$POST_FLASH_WAIT" != "0" ]]; then
+    echo "Waiting ${POST_FLASH_WAIT}s for $BOARD serial to re-enumerate..."
+    sleep "$POST_FLASH_WAIT"
+fi
+
+if ((PORT_EXPLICIT == 0)); then
+    PORT="$(detect_port)"
+fi
+
+echo "Copying firmware files over $PORT"
+
+# Copy files to the MicroPython filesystem root where main.py imports
+# secrets.py/umqttsimple.py.
+mpremote connect "$PORT" \
     cp "$MAIN_PY" :main.py + \
     cp "$SECRETS_PY" :secrets.py + \
     cp "$UMQTTSIMPLE_PY" :umqttsimple.py + \

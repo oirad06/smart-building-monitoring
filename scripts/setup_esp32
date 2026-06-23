@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Flash a generic ESP32 with MicroPython and copy the project firmware files.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT="${ESP32_PORT:-/dev/ttyUSB0}"
+
+FIRMWARE_PATH="$ROOT_DIR/esp32_firmware/mp-esp32-v1.28.0.bin"
+MAIN_PY="$ROOT_DIR/esp32_firmware/main.py"
+SECRETS_PY="$ROOT_DIR/esp32_firmware/secrets.py"
+UMQTTSIMPLE_PY="$ROOT_DIR/esp32_firmware/umqttsimple.py"
+
+esptool --port "$PORT" erase-flash
+esptool --port "$PORT" --baud 460800 write-flash 0x1000 "$FIRMWARE_PATH"
+
+# A freshly erased board formats the filesystem and prints a first-boot banner.
+# Give it time to settle before mpremote enters raw REPL, then copy files to the
+# MicroPython filesystem root where main.py imports secrets.py/umqttsimple.py.
+mpremote connect "$PORT" sleep 5 \
+    cp "$MAIN_PY" :main.py + \
+    cp "$SECRETS_PY" :secrets.py + \
+    cp "$UMQTTSIMPLE_PY" :umqttsimple.py + \
+    reset

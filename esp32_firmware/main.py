@@ -1,17 +1,27 @@
 print("Starting ESP32 firmware...")
 
+import json
 import time
+
 import dht
 import machine
-import json
 import network
-from umqttsimple import MQTTClient, MQTTException
 import ubinascii
+from umqttsimple import MQTTClient, MQTTException
 
 try:
-    from secrets import wifi_ssid, wifi_password, mqtt_server, mqtt_port, mqtt_user, mqtt_pass
+    from secrets import (
+        mqtt_pass,
+        mqtt_port,
+        mqtt_server,
+        mqtt_user,
+        wifi_password,
+        wifi_ssid,
+    )
 except ImportError:
-    raise SystemExit("ERROR: esp32_firmware/secrets.py not found. Copy secrets.py.example to secrets.py and configure WiFi + MQTT credentials.")
+    raise SystemExit(
+        "ERROR: esp32_firmware/secrets.py not found. Copy secrets.py.example to secrets.py and configure WiFi + MQTT credentials."
+    )
 
 tempVal = []
 humVal = []
@@ -22,8 +32,8 @@ MIN_VALUE = -100
 MAX_VALUE = 100
 
 # Network/broker connect retry tuning.
-WIFI_CONNECT_TIMEOUT = 30      # seconds to wait for WiFi before resetting
-MQTT_RETRY_DELAY = 5           # seconds between broker reconnect attempts
+WIFI_CONNECT_TIMEOUT = 30  # seconds to wait for WiFi before resetting
+MQTT_RETRY_DELAY = 5  # seconds between broker reconnect attempts
 
 # device_id is the chip's unique silicon ID as a hex string. It is the single
 # source of identity: MQTT client_id, the {device_id} in every topic, and the
@@ -33,6 +43,10 @@ device_id = ubinascii.hexlify(machine.unique_id()).decode()
 CONFIG_TOPIC = b"sensor/" + device_id.encode() + b"/config"
 TEMP_TOPIC = b"sensor/" + device_id.encode() + b"/temperature"
 HUM_TOPIC = b"sensor/" + device_id.encode() + b"/humidity"
+# Birth/will topic for autodiscovery. The bot learns a device from any 3-part
+# sensor/{id}/* message, so an "online" announce here registers this device
+# immediately on connect — no need to wait for the first aggregation window.
+STATUS_TOPIC = b"sensor/" + device_id.encode() + b"/status"
 
 
 def reads_per_window():
@@ -53,16 +67,16 @@ def do_connect():
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
     if not wlan.isconnected():
-        print('connecting to network...')
+        print("connecting to network...")
         wlan.connect(wifi_ssid, wifi_password)
         deadline = time.time() + WIFI_CONNECT_TIMEOUT
         while not wlan.isconnected():
             if time.time() > deadline:
-                print('WiFi connect timed out; resetting.')
+                print("WiFi connect timed out; resetting.")
                 time.sleep(1)
                 machine.reset()
             machine.idle()
-    print('network config:', wlan.ipconfig('addr4'))
+    print("network config:", wlan.ipconfig("addr4"))
 
 
 # configuration
@@ -89,12 +103,25 @@ def sub_cb(topic, msg):
     print("actual config: ", READ_INTERVAL, READ_PROCESSING, ACTIVE)
 
 
+def announce(client):
+    # Autodiscovery: tell the bus this device is present. Retained so a bot that
+    # connects later still sees us without waiting for the next sensor message.
+    client.publish(STATUS_TOPIC, b"online", retain=True, qos=0)
+    print(f"{device_id} announced online on {STATUS_TOPIC.decode()}.")
+
+
 def connect_mqtt():
-    client = MQTTClient(device_id.encode(), mqtt_server, mqtt_port, user=mqtt_user, password=mqtt_pass)
+    client = MQTTClient(
+        device_id.encode(), mqtt_server, mqtt_port, user=mqtt_user, password=mqtt_pass
+    )
     client.set_callback(sub_cb)
+    # Last will: the broker publishes this (retained) if we drop off ungracefully,
+    # so the bot can tell live devices from dead ones.
+    client.set_last_will(STATUS_TOPIC, b"offline", retain=True, qos=0)
     client.connect()
     client.subscribe(CONFIG_TOPIC)
-    print("Connected to MQTT broker and subscribed to config.")
+    announce(client)
+    print(f"{device_id} connected to MQTT broker and subscribed to config.")
     return client
 
 
@@ -114,7 +141,19 @@ def stats(values):
 def publish_measurement(client, topic, mtype, values):
     minv, maxv, mean, var = stats(values)
     print("-----STATISTICS-" + mtype.upper() + "-----")
-    print(mtype, "min:", minv, "max:", maxv, "media:", mean, "varianza:", var, "n:", len(values))
+    print(
+        mtype,
+        "min:",
+        minv,
+        "max:",
+        maxv,
+        "media:",
+        mean,
+        "varianza:",
+        var,
+        "n:",
+        len(values),
+    )
     payload = {
         "device_id": device_id,
         "measurement": {

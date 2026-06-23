@@ -70,6 +70,14 @@ broker = os.getenv("MQTT_BROKER", "130.136.2.70")
 port = int(os.getenv("MQTT_PORT", "8080"))
 username = os.getenv("MQTT_USER")
 password = os.getenv("MQTT_PASS")
+# Fail loud on missing MQTT credentials. The broker requires auth; without it
+# paho connects anonymously, the broker silently drops the client, and device
+# discovery dies quietly (empty /devices). Mirror the consumer's guard.
+if not all([broker, username, password]):
+    raise SystemExit(
+        "ERROR: MQTT_BROKER, MQTT_USER, and MQTT_PASS must be set. "
+        "Copy .env.example to .env and configure your MQTT credentials."
+    )
 
 # Known ESP32 devices: {device_id: last_seen_epoch}, populated live from the bus.
 known_devices: dict[str, float] = {}

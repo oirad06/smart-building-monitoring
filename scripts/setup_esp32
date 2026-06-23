@@ -4,11 +4,11 @@ set -euo pipefail
 
 usage() {
     cat >&2 <<'USAGE'
-Usage: scripts/setup_esp32 [--dht11|--dht22] [--device esp32|esp32s3]
+Usage: scripts/setup_esp32 [--sensor|-s dht11|dht22] [--board|-b esp32|esp32s3]
 
 Defaults:
   sensor: dht11
-  device: esp32
+  board: esp32
 
 Environment:
   ESP32_PORT=/dev/ttyUSB0  Serial port to flash (default: /dev/ttyUSB0)
@@ -18,32 +18,27 @@ USAGE
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${ESP32_PORT:-/dev/ttyUSB0}"
 SENSOR="dht11"
-SENSOR_FLAG_SET=0
-DEVICE="esp32"
+BOARD="esp32"
 
 while (($#)); do
     case "$1" in
-        --dht11|--dht22)
-            if ((SENSOR_FLAG_SET)); then
-                echo "Choose only one sensor flag: --dht11 or --dht22." >&2
-                exit 2
-            fi
-            SENSOR="${1#--}"
-            SENSOR_FLAG_SET=1
-            shift
-            ;;
-        --device)
+        --sensor|-s)
             if (($# < 2)); then
-                echo "--device requires a value: esp32 or esp32s3." >&2
+                echo "$1 requires a value: dht11 or dht22." >&2
                 usage
                 exit 2
             fi
-            DEVICE="$2"
+            SENSOR="$2"
             shift 2
             ;;
-        --esp32|--esp32s3)
-            DEVICE="${1#--}"
-            shift
+        --board|-b)
+            if (($# < 2)); then
+                echo "$1 requires a value: esp32 or esp32s3." >&2
+                usage
+                exit 2
+            fi
+            BOARD="$2"
+            shift 2
             ;;
         -h|--help)
             usage
@@ -57,7 +52,16 @@ while (($#)); do
     esac
 done
 
-case "$DEVICE" in
+case "$SENSOR" in
+    dht11|dht22)
+        ;;
+    *)
+        echo "Unsupported sensor: $SENSOR. Use dht11 or dht22." >&2
+        exit 2
+        ;;
+esac
+
+case "$BOARD" in
     esp32)
         CHIP="esp32"
         FLASH_OFFSET="0x1000"
@@ -69,7 +73,7 @@ case "$DEVICE" in
         FIRMWARE_PATH="$ROOT_DIR/esp32_firmware/mp-esp32s3-v1.28.0.bin"
         ;;
     *)
-        echo "Unsupported device: $DEVICE. Use esp32 or esp32s3." >&2
+        echo "Unsupported board: $BOARD. Use esp32 or esp32s3." >&2
         exit 2
         ;;
 esac
@@ -85,7 +89,7 @@ for path in "$FIRMWARE_PATH" "$MAIN_PY" "$SECRETS_PY" "$UMQTTSIMPLE_PY"; do
     fi
 done
 
-echo "Flashing $DEVICE ($CHIP) with $SENSOR firmware on $PORT"
+echo "Flashing $BOARD ($CHIP) with $SENSOR firmware on $PORT"
 esptool --chip "$CHIP" --port "$PORT" erase-flash
 esptool --chip "$CHIP" --port "$PORT" --baud 460800 write-flash "$FLASH_OFFSET" "$FIRMWARE_PATH"
 

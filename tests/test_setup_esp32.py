@@ -57,7 +57,7 @@ class SetupEsp32ScriptTest(unittest.TestCase):
         )
 
     def test_dht22_on_esp32s3_uses_s3_firmware_and_offset(self):
-        result, log = self.run_setup("--dht22", "--device", "esp32s3")
+        result, log = self.run_setup("--sensor", "dht22", "--board", "esp32s3")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("esptool --chip esp32s3 --port /dev/testUSB erase-flash", log)
@@ -74,17 +74,27 @@ class SetupEsp32ScriptTest(unittest.TestCase):
             log,
         )
 
-    def test_sensor_flags_are_mutually_exclusive(self):
-        result, _ = self.run_setup("--dht11", "--dht22")
+    def test_short_flags_select_sensor_and_board(self):
+        result, log = self.run_setup("-s", "dht22", "-b", "esp32s3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "write-flash 0x0 " + str(ROOT / "esp32_firmware" / "mp-esp32s3-v1.28.0.bin"),
+            log,
+        )
+        self.assertIn(str(ROOT / "esp32_firmware" / "main_dht22.py") + " :main.py", log)
+
+    def test_rejects_unknown_sensor(self):
+        result, _ = self.run_setup("--sensor", "bmp280")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Choose only one", result.stderr)
+        self.assertIn("Unsupported sensor", result.stderr)
 
-    def test_rejects_unknown_device(self):
-        result, _ = self.run_setup("--device", "esp8266")
+    def test_rejects_unknown_board(self):
+        result, _ = self.run_setup("--board", "esp8266")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Unsupported device", result.stderr)
+        self.assertIn("Unsupported board", result.stderr)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,93 @@
 #!/usr/bin/env bash
-# Flash a generic ESP32 with MicroPython and copy the project firmware files.
+# Flash an ESP32/ESP32-S3 with MicroPython and copy the selected firmware.
 set -euo pipefail
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage: scripts/setup_esp32 [--dht11|--dht22] [--device esp32|esp32s3]
+
+Defaults:
+  sensor: dht11
+  device: esp32
+
+Environment:
+  ESP32_PORT=/dev/ttyUSB0  Serial port to flash (default: /dev/ttyUSB0)
+USAGE
+}
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PORT="${ESP32_PORT:-/dev/ttyUSB0}"
+SENSOR="dht11"
+SENSOR_FLAG_SET=0
+DEVICE="esp32"
 
-FIRMWARE_PATH="$ROOT_DIR/esp32_firmware/mp-esp32-v1.28.0.bin"
-MAIN_PY="$ROOT_DIR/esp32_firmware/main.py"
+while (($#)); do
+    case "$1" in
+        --dht11|--dht22)
+            if ((SENSOR_FLAG_SET)); then
+                echo "Choose only one sensor flag: --dht11 or --dht22." >&2
+                exit 2
+            fi
+            SENSOR="${1#--}"
+            SENSOR_FLAG_SET=1
+            shift
+            ;;
+        --device)
+            if (($# < 2)); then
+                echo "--device requires a value: esp32 or esp32s3." >&2
+                usage
+                exit 2
+            fi
+            DEVICE="$2"
+            shift 2
+            ;;
+        --esp32|--esp32s3)
+            DEVICE="${1#--}"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+case "$DEVICE" in
+    esp32)
+        CHIP="esp32"
+        FLASH_OFFSET="0x1000"
+        FIRMWARE_PATH="$ROOT_DIR/esp32_firmware/mp-esp32-v1.28.0.bin"
+        ;;
+    esp32s3)
+        CHIP="esp32s3"
+        FLASH_OFFSET="0x0"
+        FIRMWARE_PATH="$ROOT_DIR/esp32_firmware/mp-esp32s3-v1.28.0.bin"
+        ;;
+    *)
+        echo "Unsupported device: $DEVICE. Use esp32 or esp32s3." >&2
+        exit 2
+        ;;
+esac
+
+MAIN_PY="$ROOT_DIR/esp32_firmware/main_${SENSOR}.py"
 SECRETS_PY="$ROOT_DIR/esp32_firmware/secrets.py"
 UMQTTSIMPLE_PY="$ROOT_DIR/esp32_firmware/umqttsimple.py"
 
-esptool --port "$PORT" erase-flash
-esptool --port "$PORT" --baud 460800 write-flash 0x1000 "$FIRMWARE_PATH"
+for path in "$FIRMWARE_PATH" "$MAIN_PY" "$SECRETS_PY" "$UMQTTSIMPLE_PY"; do
+    if [[ ! -f "$path" ]]; then
+        echo "Required file not found: $path" >&2
+        exit 1
+    fi
+done
+
+echo "Flashing $DEVICE ($CHIP) with $SENSOR firmware on $PORT"
+esptool --chip "$CHIP" --port "$PORT" erase-flash
+esptool --chip "$CHIP" --port "$PORT" --baud 460800 write-flash "$FLASH_OFFSET" "$FIRMWARE_PATH"
 
 # A freshly erased board formats the filesystem and prints a first-boot banner.
 # Give it time to settle before mpremote enters raw REPL, then copy files to the

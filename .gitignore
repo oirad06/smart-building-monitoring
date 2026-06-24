@@ -6,6 +6,9 @@ token.txt
 secrets.py
 CHANGES.md
 
+# --- Bot runtime state (created on demand, not shared) ---
+data/devices.json
+
 # --- Python virtual environments ---
 .venv
 venv

@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import warnings
 from datetime import datetime, timezone
@@ -13,6 +14,11 @@ from actions import (
     delete_action_row,
     read_actions,
     update_action_row,
+)
+from devices import (
+    get_device_config,
+    has_device_config,
+    set_device_config,
 )
 from rooms import (
     add_room,
@@ -29,7 +35,6 @@ from dotenv import load_dotenv
 from paho.mqtt import client as mqtt
 from telegram import (
     BotCommand,
-    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -139,10 +144,10 @@ logger = logging.getLogger(__name__)
 ROOM_NAME, AC_COUNT, DEVICE_SELECTION = range(3)
 # /event
 EVENT_ROOM, EVENT_PEOPLE, EVENT_COOL, EVENT_HEAT = range(10, 14)
-# /devices
-DEV_SELECT, DEV_INTERVAL, DEV_PROCESSING, DEV_ACTIVE = range(20, 24)
+# /devices — menu-driven: list → per-device config menu → field edits
+DEV_SELECT, DEV_MENU, DEV_INTERVAL, DEV_PROCESSING, DEV_ROOM = range(20, 25)
 # /rooms
-RM_PICK, RM_MENU, RM_RENAME, RM_AC, RM_DEVICES, RM_DELETE = range(30, 36)
+RM_PICK, RM_MENU, RM_RENAME, RM_AC, RM_DEVICES, RM_DELETE, RM_REMOVE = range(30, 37)
 # /events
 EV_PAGE, EV_EDIT_PEOPLE, EV_EDIT_COOL, EV_EDIT_HEAT = range(40, 44)
 
@@ -153,9 +158,39 @@ EVENTS_PER_PAGE = 10
 # ─────────────────────────────────────────────────────────────────────────────
 # UI helpers
 # ─────────────────────────────────────────────────────────────────────────────
+# Universal cancel/back affordances. Every conversation exposes these so the
+# user never has to type /cancel. Inline flows get a callback button; free-text
+# prompts (which use a ReplyKeyboardMarkup) get a matching keyboard row.
+CANCEL_DATA = "flow_cancel"
+CANCEL_LABEL = "❌ Annulla"
+BACK_LABEL = "« Indietro"
+
+# Text typed by tapping the reply-keyboard cancel key. State MessageHandlers use
+# TEXT_INPUT (which excludes it) so it falls through to the cancel fallback.
+TEXT_INPUT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(rf"^{re.escape(CANCEL_LABEL)}$")
+
+
+def cancel_button():
+    return InlineKeyboardButton(CANCEL_LABEL, callback_data=CANCEL_DATA)
+
+
+def back_button(callback_data):
+    return InlineKeyboardButton(BACK_LABEL, callback_data=callback_data)
+
+
+def cancel_keyboard(placeholder="Scrivi un valore o annulla"):
+    """Reply keyboard with only a cancel key, for free-text prompts."""
+    return ReplyKeyboardMarkup(
+        [[CANCEL_LABEL]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder=placeholder,
+    )
+
+
 def number_keyboard(placeholder="Numero (>= 0)"):
     return ReplyKeyboardMarkup(
-        [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["0"]],
+        [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"], ["0"], [CANCEL_LABEL]],
         resize_keyboard=True,
         one_time_keyboard=True,
         input_field_placeholder=placeholder,
@@ -185,6 +220,7 @@ def device_keyboard(devices, assigned, selected):
         label = mark + dev + (f" ({room})" if room else "")
         rows.append([InlineKeyboardButton(label, callback_data=dev)])
     rows.append([InlineKeyboardButton("Done", callback_data="done")])
+    rows.append([cancel_button()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -226,15 +262,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Comandi disponibili:\n"
         "/setup — crea una nuova stanza\n"
-        "/rooms — gestisci le stanze (rinomina, AC, dispositivi, elimina)\n"
+        "/rooms — gestisci le stanze (rinomina, AC, assegna/rimuovi dispositivi, elimina)\n"
         "/event — registra un evento (persone + condizionatori)\n"
         "/events — modifica o elimina eventi recenti\n"
-        "/devices — configura i sensori ESP32\n"
+        "/devices — vedi e modifica la configurazione dei sensori ESP32 (valori + stanza)\n"
         "/show — mostra dati sensori + eventi\n"
         "/sensors — scarica sensors.csv\n"
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
-        "/cancel — annulla l'operazione in corso",
+        "/cancel — annulla l'operazione (oppure usa il pulsante ❌ Annulla in ogni flusso)",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -253,7 +289,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # /setup — create room (name → AC count → device multi-select → save)
 # ─────────────────────────────────────────────────────────────────────────────
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Inserisci il nome della stanza:")
+    await update.message.reply_text(
+        "Inserisci il nome della stanza:", reply_markup=cancel_keyboard()
+    )
     return ROOM_NAME
 
 
@@ -266,7 +304,7 @@ async def save_room_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Esiste già una stanza con questo nome.")
         return ROOM_NAME
     context.user_data["room_name"] = name
-    await update.message.reply_text("Quanti condizionatori ci sono?", reply_markup=ForceReply())
+    await update.message.reply_text("Quanti condizionatori ci sono?", reply_markup=number_keyboard())
     return AC_COUNT
 
 
@@ -295,6 +333,8 @@ async def save_ac_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def save_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.data == CANCEL_DATA:
+        return await cancel(update, context)
     await query.answer()
     selected = context.user_data.setdefault("selected_devices", [])
     devices = context.user_data["devices"]
@@ -342,12 +382,34 @@ async def save_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 # /rooms — manage existing rooms
 # ─────────────────────────────────────────────────────────────────────────────
+def _room_menu_text(name):
+    room = get_room(name)
+    return (
+        f"Stanza: {name}\n"
+        f"AC totali: {room['num_ac']}\n"
+        f"Dispositivi: {', '.join(room.get('device_ids', [])) or 'nessuno'}"
+    )
+
+
+def _room_menu_markup():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Rinomina", callback_data="rm_rename"),
+         InlineKeyboardButton("Cambia AC", callback_data="rm_ac")],
+        [InlineKeyboardButton("Assegna dispositivi", callback_data="rm_devices"),
+         InlineKeyboardButton("Rimuovi dispositivi", callback_data="rm_remove")],
+        [InlineKeyboardButton("Elimina stanza", callback_data="rm_delete")],
+        [back_button("rm_back"), cancel_button()],
+    ])
+
+
 async def rooms_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     names = get_room_names()
     if not names:
         await update.message.reply_text("Nessuna stanza. Creane una con /setup.")
         return ConversationHandler.END
-    await update.message.reply_text("Scegli una stanza:", reply_markup=room_buttons())
+    await update.message.reply_text(
+        "Scegli una stanza:", reply_markup=room_buttons(extra=[[cancel_button()]])
+    )
     return RM_PICK
 
 
@@ -359,20 +421,7 @@ async def rooms_show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Stanza non più esistente.")
         return ConversationHandler.END
     context.user_data["room"] = name
-    room = get_room(name)
-    text = (
-        f"Stanza: {name}\n"
-        f"AC totali: {room['num_ac']}\n"
-        f"Dispositivi: {', '.join(room.get('device_ids', [])) or 'nessuno'}"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Rinomina", callback_data="rm_rename"),
-         InlineKeyboardButton("Cambia AC", callback_data="rm_ac")],
-        [InlineKeyboardButton("Assegna dispositivi", callback_data="rm_devices"),
-         InlineKeyboardButton("Elimina stanza", callback_data="rm_delete")],
-        [InlineKeyboardButton("« Indietro", callback_data="rm_back")],
-    ])
-    await query.edit_message_text(text, reply_markup=kb)
+    await query.edit_message_text(_room_menu_text(name), reply_markup=_room_menu_markup())
     return RM_MENU
 
 
@@ -383,12 +432,13 @@ async def rooms_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = context.user_data.get("room")
 
     if action == "rm_back":
-        names = get_room_names()
-        await query.edit_message_text("Scegli una stanza:", reply_markup=room_buttons())
+        await query.edit_message_text(
+            "Scegli una stanza:", reply_markup=room_buttons(extra=[[cancel_button()]])
+        )
         return RM_PICK
 
     if action == "rm_rename":
-        await query.message.reply_text("Nuovo nome della stanza?", reply_markup=ForceReply())
+        await query.message.reply_text("Nuovo nome della stanza?", reply_markup=cancel_keyboard())
         return RM_RENAME
 
     if action == "rm_ac":
@@ -407,6 +457,9 @@ async def rooms_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=device_keyboard(devices, assigned, list(existing)),
         )
         return RM_DEVICES
+
+    if action == "rm_remove":
+        return await _show_room_remove_menu(update, context)
 
     if action == "rm_delete":
         await query.edit_message_text(
@@ -453,6 +506,8 @@ async def rooms_ac(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def rooms_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if query.data == CANCEL_DATA:
+        return await cancel(update, context)
     await query.answer()
     selected = context.user_data.setdefault("selected_devices", [])
     devices = context.user_data["devices"]
@@ -489,6 +544,51 @@ async def rooms_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def _rooms_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Re-render the room action menu (used by sub-flow Back buttons)."""
+    name = context.user_data.get("room")
+    query = update.callback_query
+    if not name or not room_exists(name):
+        await query.edit_message_text(
+            "Scegli una stanza:", reply_markup=room_buttons(extra=[[cancel_button()]])
+        )
+        return RM_PICK
+    await query.edit_message_text(_room_menu_text(name), reply_markup=_room_menu_markup())
+    return RM_MENU
+
+
+def _room_remove_markup(name):
+    ids = (get_room(name) or {}).get("device_ids", [])
+    rows = [[InlineKeyboardButton(f"🗑 {d}", callback_data=f"rmrm_{d}")] for d in ids]
+    rows.append([back_button("rmrm_back"), cancel_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_room_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data["room"]
+    ids = (get_room(name) or {}).get("device_ids", [])
+    text = (
+        f"Dispositivi di '{name}' — tocca per rimuovere:" if ids
+        else f"'{name}' non ha dispositivi assegnati."
+    )
+    await update.callback_query.edit_message_text(text, reply_markup=_room_remove_markup(name))
+    return RM_REMOVE
+
+
+async def rooms_remove_device(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    name = context.user_data.get("room")
+    if query.data == "rmrm_back":
+        return await _rooms_back_to_menu(update, context)
+    if name and query.data.startswith("rmrm_"):
+        dev = query.data[len("rmrm_"):]
+        ids = [d for d in (get_room(name) or {}).get("device_ids", []) if d != dev]
+        update_room(name, device_ids=ids)
+        return await _show_room_remove_menu(update, context)
+    return RM_REMOVE
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # /event — record one event (room → people → AC cool → AC heat → validate)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -497,7 +597,10 @@ async def event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not names:
         await update.message.reply_text("Nessuna stanza. Creane una con /setup.")
         return ConversationHandler.END
-    await update.message.reply_text("Seleziona la stanza:", reply_markup=room_buttons(prefix="eroom_"))
+    await update.message.reply_text(
+        "Seleziona la stanza:",
+        reply_markup=room_buttons(prefix="eroom_", extra=[[cancel_button()]]),
+    )
     return EVENT_ROOM
 
 
@@ -614,6 +717,7 @@ def _events_nav_keyboard(page, total):
             InlineKeyboardButton("Modifica", callback_data=f"ev_edit_{idx}"),
             InlineKeyboardButton("Elimina", callback_data=f"ev_del_{idx}"),
         ])
+    rows.append([cancel_button()])
     return InlineKeyboardMarkup(rows)
 
 
@@ -625,8 +729,6 @@ async def _events_render(update, context, page, edit):
     page_rows, total, page = _events_page_rows(page)
     text = _render_events(None, page_rows, total, page)
     kb = _events_nav_keyboard(page, total)
-    if not page_rows:
-        kb = None
     context.user_data["page"] = page
     if update.callback_query:
         await update.callback_query.answer()
@@ -725,22 +827,41 @@ async def events_edit_heat(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /devices — list ESP32s + push config
+# /devices — list ESP32s → per-device config menu (view, edit fields, room, save)
 # ─────────────────────────────────────────────────────────────────────────────
-async def devices_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _device_list_text_kb():
     devices = get_known_devices()
     if not devices:
-        await update.message.reply_text("Nessun dispositivo rilevato sui bus MQTT.")
-        return ConversationHandler.END
+        return None, None
     now = time.time()
-    lines = []
-    rows = []
+    lines, rows = [], []
     for dev in devices:
         room = get_device_room(dev) or "—"
         age = int(now - known_devices.get(dev, now))
         lines.append(f"• {dev} | stanza: {room} | ultimo segnale: {age}s fa")
         rows.append([InlineKeyboardButton(f"Configura {dev}", callback_data=f"devcfg_{dev}")])
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+    rows.append([cancel_button()])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def devices_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = _device_list_text_kb()
+    if text is None:
+        await update.message.reply_text("Nessun dispositivo rilevato sui bus MQTT.")
+        return ConversationHandler.END
+    await update.message.reply_text(text, reply_markup=kb)
+    return DEV_SELECT
+
+
+async def _back_to_device_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for k in ("device", "dev_cfg", "dev_room", "dev_room_orig", "dev_saved"):
+        context.user_data.pop(k, None)
+    text, kb = _device_list_text_kb()
+    query = update.callback_query
+    if text is None:
+        await query.edit_message_text("Nessun dispositivo rilevato sui bus MQTT.")
+        return ConversationHandler.END
+    await query.edit_message_text(text, reply_markup=kb)
     return DEV_SELECT
 
 
@@ -749,8 +870,75 @@ async def devices_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     dev = query.data[len("devcfg_"):]
     context.user_data["device"] = dev
-    await query.message.reply_text("read_interval (secondi)?", reply_markup=number_keyboard())
-    return DEV_INTERVAL
+    context.user_data["dev_cfg"] = get_device_config(dev)
+    context.user_data["dev_room"] = get_device_room(dev)
+    context.user_data["dev_room_orig"] = get_device_room(dev)
+    context.user_data["dev_saved"] = has_device_config(dev)
+    return await _show_device_menu(update, context)
+
+
+def _device_menu_markup(cfg):
+    state = "Acceso" if cfg["active"] else "Spento"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Intervallo: {cfg['read_interval']}s", callback_data="devset_interval"),
+         InlineKeyboardButton(f"Letture: {cfg['read_processing']}", callback_data="devset_processing")],
+        [InlineKeyboardButton(f"Stato: {state}", callback_data="devset_toggle")],
+        [InlineKeyboardButton("Stanza", callback_data="devset_room")],
+        [InlineKeyboardButton("💾 Salva e invia", callback_data="devset_save")],
+        [back_button("devset_list"), cancel_button()],
+    ])
+
+
+def _device_menu_text(context):
+    dev = context.user_data["device"]
+    cfg = context.user_data["dev_cfg"]
+    room = context.user_data.get("dev_room")
+    text = (
+        f"Configurazione di {dev}\n\n"
+        f"Stanza: {room or 'nessuna'}\n"
+        f"Intervallo lettura: {cfg['read_interval']} s\n"
+        f"Letture per finestra: {cfg['read_processing']}\n"
+        f"Stato: {'Acceso' if cfg['active'] else 'Spento'}"
+    )
+    if not context.user_data.get("dev_saved"):
+        text += "\n\n(Valori predefiniti: nessuna configurazione salvata.)"
+    return text
+
+
+async def _show_device_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = _device_menu_text(context)
+    kb = _device_menu_markup(context.user_data["dev_cfg"])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
+    return DEV_MENU
+
+
+async def devices_menu_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data
+    if action == "devset_list":
+        return await _back_to_device_list(update, context)
+    if action == "devset_interval":
+        await query.message.reply_text(
+            "Nuovo intervallo di lettura (secondi, > 0)?", reply_markup=number_keyboard()
+        )
+        return DEV_INTERVAL
+    if action == "devset_processing":
+        await query.message.reply_text(
+            "Nuove letture per finestra (> 0)?", reply_markup=number_keyboard()
+        )
+        return DEV_PROCESSING
+    if action == "devset_toggle":
+        context.user_data["dev_cfg"]["active"] = not context.user_data["dev_cfg"]["active"]
+        return await _show_device_menu(update, context)
+    if action == "devset_room":
+        return await _show_device_room_menu(update, context)
+    if action == "devset_save":
+        return await _save_device_config(update, context)
+    return DEV_MENU
 
 
 async def devices_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -761,9 +949,8 @@ async def devices_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (ValueError, TypeError):
         await update.message.reply_text("Numero non valido (> 0).", reply_markup=number_keyboard())
         return DEV_INTERVAL
-    context.user_data["read_interval"] = val
-    await update.message.reply_text("read_processing (numero di letture)?", reply_markup=number_keyboard())
-    return DEV_PROCESSING
+    context.user_data["dev_cfg"]["read_interval"] = val
+    return await _show_device_menu(update, context)
 
 
 async def devices_processing(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -774,35 +961,77 @@ async def devices_processing(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except (ValueError, TypeError):
         await update.message.reply_text("Numero non valido (> 0).", reply_markup=number_keyboard())
         return DEV_PROCESSING
-    context.user_data["read_processing"] = val
-    await update.message.reply_text(
-        "Attivo?",
-        reply_markup=ReplyKeyboardMarkup(
-            [["Acceso", "Spento"]], resize_keyboard=True, one_time_keyboard=True,
-            input_field_placeholder="Acceso o Spento?",
-        ),
+    context.user_data["dev_cfg"]["read_processing"] = val
+    return await _show_device_menu(update, context)
+
+
+def _device_room_markup(current):
+    rows = []
+    for name in get_room_names():
+        mark = "✅ " if name == current else ""
+        rows.append([InlineKeyboardButton(mark + name, callback_data=f"devroom_pick_{name}")])
+    if current:
+        rows.append([InlineKeyboardButton("🗑 Rimuovi dalla stanza", callback_data="devroom_rm")])
+    rows.append([back_button("devroom_back"), cancel_button()])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_device_room_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = context.user_data.get("dev_room")
+    dev = context.user_data["device"]
+    text = (
+        f"Stanza per {dev}: {current or 'nessuna'}\n"
+        "Seleziona una stanza o rimuovi l'assegnazione:"
     )
-    return DEV_ACTIVE
+    await update.callback_query.edit_message_text(text, reply_markup=_device_room_markup(current))
+    return DEV_ROOM
 
 
-async def devices_active(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip().lower()
-    if text == "acceso":
-        active = True
-    elif text == "spento":
-        active = False
+async def devices_room_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data == "devroom_back":
+        return await _show_device_menu(update, context)
+    if data == "devroom_rm":
+        context.user_data["dev_room"] = None
+        return await _show_device_menu(update, context)
+    if data.startswith("devroom_pick_"):
+        name = data[len("devroom_pick_"):]
+        if not room_exists(name):
+            return await _show_device_room_menu(update, context)
+        context.user_data["dev_room"] = name
+        return await _show_device_menu(update, context)
+    return DEV_ROOM
+
+
+async def _save_device_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    dev = context.user_data["device"]
+    cfg = context.user_data["dev_cfg"]
+    new_room = context.user_data.get("dev_room")
+    orig_room = context.user_data.get("dev_room_orig")
+
+    send_device_config(dev, cfg["read_interval"], cfg["read_processing"], cfg["active"])
+    set_device_config(dev, cfg["read_interval"], cfg["read_processing"], cfg["active"])
+
+    if new_room != orig_room:
+        # Room (re)assignment: detach from every room, then attach to the target.
+        remove_device_from_all_rooms(dev)
+        if new_room and room_exists(new_room):
+            ids = get_room(new_room).get("device_ids", [])
+            if dev not in ids:
+                update_room(new_room, device_ids=ids + [dev])
+            room_line = f"\nStanza: {new_room}"
+        else:
+            room_line = "\nStanza: rimossa"
     else:
-        await update.message.reply_text("Scegli Acceso o Spento.")
-        return DEV_ACTIVE
-    send_device_config(
-        context.user_data["device"],
-        context.user_data["read_interval"],
-        context.user_data["read_processing"],
-        active,
-    )
-    await update.message.reply_text(
-        f"✅ Configurazione inviata a {context.user_data['device']}.",
-        reply_markup=ReplyKeyboardRemove(),
+        room_line = f"\nStanza: {orig_room or 'nessuna'}"
+
+    await update.callback_query.edit_message_text(
+        f"✅ Configurazione inviata a {dev}.\n"
+        f"Intervallo: {cfg['read_interval']}s | Letture: {cfg['read_processing']} | "
+        f"Stato: {'Acceso' if cfg['active'] else 'Spento'}"
+        + room_line
     )
     context.user_data.clear()
     return ConversationHandler.END
@@ -980,6 +1209,16 @@ async def post_init(application: Application):
         logger.warning("MQTT unavailable (%s); device features disabilitate.", e)
 
 
+def _cancel_fallbacks():
+    """Shared fallbacks so every conversation is escapable without /cancel:
+    the command, the inline cancel button, or the reply-keyboard cancel key."""
+    return [
+        CommandHandler("cancel", cancel),
+        CallbackQueryHandler(cancel, pattern=f"^{CANCEL_DATA}$"),
+        MessageHandler(filters.Regex(rf"^{re.escape(CANCEL_LABEL)}$"), cancel),
+    ]
+
+
 def _build_application():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -991,11 +1230,11 @@ def _build_application():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("setup", setup_start)],
         states={
-            ROOM_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_room_name)],
-            AC_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_ac_count)],
+            ROOM_NAME: [MessageHandler(TEXT_INPUT, save_room_name)],
+            AC_COUNT: [MessageHandler(TEXT_INPUT, save_ac_count)],
             DEVICE_SELECTION: [CallbackQueryHandler(save_devices)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=_cancel_fallbacks(),
     ))
 
     app.add_handler(ConversationHandler(
@@ -1003,45 +1242,47 @@ def _build_application():
         states={
             RM_PICK: [CallbackQueryHandler(rooms_show_menu, pattern="^room_")],
             RM_MENU: [CallbackQueryHandler(rooms_menu_action, pattern="^rm_")],
-            RM_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rooms_rename)],
-            RM_AC: [MessageHandler(filters.TEXT & ~filters.COMMAND, rooms_ac)],
+            RM_RENAME: [MessageHandler(TEXT_INPUT, rooms_rename)],
+            RM_AC: [MessageHandler(TEXT_INPUT, rooms_ac)],
             RM_DEVICES: [CallbackQueryHandler(rooms_devices)],
+            RM_REMOVE: [CallbackQueryHandler(rooms_remove_device, pattern="^rmrm_")],
             RM_DELETE: [CallbackQueryHandler(rooms_delete, pattern="^rm_del")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=_cancel_fallbacks(),
     ))
 
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("event", event_start)],
         states={
             EVENT_ROOM: [CallbackQueryHandler(event_room, pattern="^eroom_")],
-            EVENT_PEOPLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_people)],
-            EVENT_COOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_cool)],
-            EVENT_HEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, event_heat)],
+            EVENT_PEOPLE: [MessageHandler(TEXT_INPUT, event_people)],
+            EVENT_COOL: [MessageHandler(TEXT_INPUT, event_cool)],
+            EVENT_HEAT: [MessageHandler(TEXT_INPUT, event_heat)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=_cancel_fallbacks(),
     ))
 
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("events", events_start)],
         states={
             EV_PAGE: [CallbackQueryHandler(events_page_action, pattern="^ev_")],
-            EV_EDIT_PEOPLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, events_edit_people)],
-            EV_EDIT_COOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, events_edit_cool)],
-            EV_EDIT_HEAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, events_edit_heat)],
+            EV_EDIT_PEOPLE: [MessageHandler(TEXT_INPUT, events_edit_people)],
+            EV_EDIT_COOL: [MessageHandler(TEXT_INPUT, events_edit_cool)],
+            EV_EDIT_HEAT: [MessageHandler(TEXT_INPUT, events_edit_heat)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=_cancel_fallbacks(),
     ))
 
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("devices", devices_start)],
         states={
             DEV_SELECT: [CallbackQueryHandler(devices_pick, pattern="^devcfg_")],
-            DEV_INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, devices_interval)],
-            DEV_PROCESSING: [MessageHandler(filters.TEXT & ~filters.COMMAND, devices_processing)],
-            DEV_ACTIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, devices_active)],
+            DEV_MENU: [CallbackQueryHandler(devices_menu_action, pattern="^devset_")],
+            DEV_INTERVAL: [MessageHandler(TEXT_INPUT, devices_interval)],
+            DEV_PROCESSING: [MessageHandler(TEXT_INPUT, devices_processing)],
+            DEV_ROOM: [CallbackQueryHandler(devices_room_action, pattern="^devroom_")],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=_cancel_fallbacks(),
     ))
 
     # Read-only views & downloads (no text state → plain handlers + global callback).

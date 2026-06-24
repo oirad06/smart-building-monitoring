@@ -97,14 +97,14 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Stanza: Lab", text)
         self.assertNotIn("predefiniti", text)  # config was saved
 
-    async def test_unconfigured_device_shows_defaults_note(self):
+    async def test_unconfigured_device_shows_not_confirmed_note(self):
         bot.known_devices["fresh"] = time.time()
         ctx = Ctx()
         q = FakeQuery("devcfg_fresh")
         await bot.devices_pick(FakeUpdate(query=q), ctx)
         text = q.edits[-1][0]
         self.assertIn("Intervallo lettura: 1 s", text)
-        self.assertIn("predefiniti", text)
+        self.assertIn("non confermati", text)  # device never echoed config_state
 
     async def test_full_edit_and_save_publishes_persists_and_assigns_room(self):
         bot.known_devices["dev"] = time.time()
@@ -190,7 +190,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         app = bot._build_application()
         convs = [h for grp in app.handlers.values() for h in grp
                  if isinstance(h, ConversationHandler)]
-        self.assertEqual(len(convs), 5)
+        self.assertEqual(len(convs), 6)  # setup, rooms, event, events, devices, alerts
         for c in convs:
             kinds = [type(f).__name__ for f in c.fallbacks]
             self.assertEqual(

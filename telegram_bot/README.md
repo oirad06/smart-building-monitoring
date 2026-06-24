@@ -23,6 +23,13 @@ Every conversation also carries an inline **❌ Annulla** button (and **« Indie
 in menus); free-text prompts add a cancel key to the keyboard, so `/cancel` is
 never required. The bot menu is registered automatically via `set_my_commands`.
 
+## Access control
+
+Set `ALLOWED_USER_IDS` in `.env` to a comma/space separated list of Telegram
+user IDs to restrict the bot to those users; anyone else gets
+`⛔ Non sei autorizzato a usare questo bot.` and is blocked. Leave it empty or
+unset to keep the bot open to everyone (default, backward compatible).
+
 ## Setup
 
 ```bash

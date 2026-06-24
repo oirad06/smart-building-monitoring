@@ -1269,7 +1269,8 @@ def _install_features(app):
     """Feature plugins register their handlers here (auth, charts, status,
     alerts, …). Each feature adds one import + install() call. Runs before the
     catch-all echo handler so feature commands take precedence."""
-    pass
+    import auth
+    auth.install(app)
 
 
 def _build_application():

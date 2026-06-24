@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import io
 import json
@@ -101,6 +102,23 @@ def connect_mqtt() -> mqtt.Client:
     return client
 
 
+# Extension seams for feature plugins (alerts, presence, …). Listeners run on
+# paho's network thread — never await here; marshal to the bot loop via
+# run_on_bot_loop(). post_init hooks run on the asyncio loop.
+_message_listeners = []          # list[fn(topic: str, payload: str, parts: list[str])]
+_post_init_hooks = []            # list[async fn(application)]
+_app = None                      # set in post_init
+_loop = None                     # the bot's asyncio loop, set in post_init
+
+
+def run_on_bot_loop(coro):
+    """Schedule a coroutine on the bot's asyncio loop from any thread.
+    Safe to call from paho's network thread. Returns the Future or None."""
+    if _loop is not None and _loop.is_running():
+        return asyncio.run_coroutine_threadsafe(coro, _loop)
+    return None
+
+
 def _on_mqtt_message(client, userdata, msg):
     """Live device discovery: learn device IDs from any sensor message + the
     retained discovery snapshot published by the consumer."""
@@ -114,6 +132,15 @@ def _on_mqtt_message(client, userdata, msg):
     parts = msg.topic.split("/")
     if len(parts) == 3 and parts[0] == "sensor":
         known_devices[parts[1]] = time.time()
+    try:
+        payload = msg.payload.decode()
+    except Exception:
+        payload = ""
+    for listener in _message_listeners:
+        try:
+            listener(msg.topic, payload, parts)
+        except Exception:
+            logger.exception("message listener failed")
 
 
 def send_device_config(device_id, read_interval, read_processing, active):
@@ -1185,6 +1212,9 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 async def post_init(application: Application):
     """Register the bot menu and bring up the MQTT discovery client."""
+    global _app, _loop
+    _app = application
+    _loop = asyncio.get_running_loop()
     await application.bot.set_my_commands([
         BotCommand("setup", "Crea una nuova stanza"),
         BotCommand("rooms", "Gestisci le stanze"),
@@ -1207,6 +1237,11 @@ async def post_init(application: Application):
         logger.info("MQTT discovery client started.")
     except Exception as e:
         logger.warning("MQTT unavailable (%s); device features disabilitate.", e)
+    for hook in _post_init_hooks:
+        try:
+            await hook(application)
+        except Exception:
+            logger.exception("post_init hook failed")
 
 
 def _cancel_fallbacks():
@@ -1217,6 +1252,13 @@ def _cancel_fallbacks():
         CallbackQueryHandler(cancel, pattern=f"^{CANCEL_DATA}$"),
         MessageHandler(filters.Regex(rf"^{re.escape(CANCEL_LABEL)}$"), cancel),
     ]
+
+
+def _install_features(app):
+    """Feature plugins register their handlers here (auth, charts, status,
+    alerts, …). Each feature adds one import + install() call. Runs before the
+    catch-all echo handler so feature commands take precedence."""
+    pass
 
 
 def _build_application():
@@ -1296,6 +1338,7 @@ def _build_application():
         downloads_callback,
         pattern="^(show|sensors|actions|config)_",
     ))
+    _install_features(app)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     return app
 

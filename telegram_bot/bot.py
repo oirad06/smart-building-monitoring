@@ -31,6 +31,7 @@ from rooms import (
     room_exists,
     update_room,
 )
+import presence
 
 from dotenv import load_dotenv
 from paho.mqtt import client as mqtt
@@ -162,7 +163,7 @@ def send_device_config(device_id, read_interval, read_processing, active):
         "read_processing": read_processing,
         "active": active,
     })
-    mqtt_client.publish(f"sensor/{device_id}/config", payload)
+    mqtt_client.publish(f"sensor/{device_id}/config", payload, retain=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -876,7 +877,7 @@ def _device_list_text_kb():
     for dev in devices:
         room = get_device_room(dev) or "—"
         age = int(now - known_devices.get(dev, now))
-        lines.append(f"• {dev} | stanza: {room} | ultimo segnale: {age}s fa")
+        lines.append(f"{presence.status_icon(dev)} {dev} | stanza: {room} | ultimo segnale: {age}s fa")
         rows.append([InlineKeyboardButton(f"Configura {dev}", callback_data=f"devcfg_{dev}")])
     rows.append([cancel_button()])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -938,8 +939,10 @@ def _device_menu_text(context):
         f"Letture per finestra: {cfg['read_processing']}\n"
         f"Stato: {'Acceso' if cfg['active'] else 'Spento'}"
     )
-    if not context.user_data.get("dev_saved"):
-        text += "\n\n(Valori predefiniti: nessuna configurazione salvata.)"
+    if presence.is_confirmed(dev):
+        text += "\n\n(configurazione confermata dal dispositivo)"
+    else:
+        text += "\n\n(valori non confermati dal dispositivo)"
     return text
 
 
@@ -1269,7 +1272,8 @@ def _install_features(app):
     """Feature plugins register their handlers here (auth, charts, status,
     alerts, …). Each feature adds one import + install() call. Runs before the
     catch-all echo handler so feature commands take precedence."""
-    pass
+    import presence
+    presence.install(app)
 
 
 def _build_application():

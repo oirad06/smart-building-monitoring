@@ -18,6 +18,7 @@ shared `data/` folder.
 | `/actions` | Download `actions.csv` (full export or per room) |
 | `/config` | Download `rooms.json` (all rooms or single room) |
 | `/cancel` | Abort any in-progress conversation |
+| `/status` | System health summary (MQTT, known devices, last sensor data, room count) |
 
 Every conversation also carries an inline **❌ Annulla** button (and **« Indietro**
 in menus); free-text prompts add a cancel key to the keyboard, so `/cancel` is

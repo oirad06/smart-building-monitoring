@@ -191,7 +191,6 @@ RM_PICK, RM_MENU, RM_RENAME, RM_AC, RM_DEVICES, RM_DELETE, RM_REMOVE = range(30,
 # /events
 EV_PAGE, EV_EDIT_PEOPLE, EV_EDIT_COOL, EV_EDIT_HEAT = range(40, 44)
 
-ROOMS_PER_PAGE = 0  # unused sentinel
 EVENTS_PER_PAGE = 10
 
 
@@ -327,6 +326,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/sensors — scarica sensors.csv\n"
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
+        "/status — stato del sistema (MQTT, dispositivi, sensori, stanze)\n"
         "/cancel — annulla l'operazione (oppure usa il pulsante ❌ Annulla in ogni flusso)",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -1265,6 +1265,7 @@ async def post_init(application: Application):
         BotCommand("actions", "Scarica dati eventi"),
         BotCommand("config", "Scarica configurazione stanze"),
         BotCommand("cancel", "Annulla operazione"),
+        BotCommand("status", "Stato del sistema"),
     ])
     global mqtt_client
     try:
@@ -1301,6 +1302,8 @@ def _install_features(app):
     auth.install(app)
     import presence
     presence.install(app)
+    import status_cmd
+    status_cmd.install(app)
 
 
 def _build_application():

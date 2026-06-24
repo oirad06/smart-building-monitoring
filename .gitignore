@@ -8,6 +8,9 @@ CHANGES.md
 
 # --- Bot runtime state (created on demand, not shared) ---
 data/devices.json
+data/monitor.db
+data/monitor.db-wal
+data/monitor.db-shm
 
 # --- Python virtual environments ---
 .venv

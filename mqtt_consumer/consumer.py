@@ -4,7 +4,7 @@ import os
 import random
 from datetime import datetime, timezone
 
-from sensor import get_room_for_device, append_sensor_row
+from sensor import get_room_for_device, append_sensor_row, migrate_csv
 from dotenv import load_dotenv
 from paho.mqtt import client as mqtt_client
 
@@ -88,6 +88,7 @@ def on_message(client, userdata, msg):
 
 
 def run():
+    migrate_csv()
     client = connect_mqtt()
     client.on_message = on_message
     for topic in topics:

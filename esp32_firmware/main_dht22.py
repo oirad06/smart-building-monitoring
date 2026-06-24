@@ -47,6 +47,9 @@ HUM_TOPIC = b"sensor/" + device_id.encode() + b"/humidity"
 # sensor/{id}/* message, so an "online" announce here registers this device
 # immediately on connect — no need to wait for the first aggregation window.
 STATUS_TOPIC = b"sensor/" + device_id.encode() + b"/status"
+# Retained mirror of the device's CURRENT applied config. The bot reads this to
+# show ground truth (not just what it last pushed) and to confirm a config took.
+CONFIG_STATE_TOPIC = b"sensor/" + device_id.encode() + b"/config_state"
 
 
 def reads_per_window():
@@ -101,6 +104,7 @@ def sub_cb(topic, msg):
     Contatore = reads_per_window()
     print("config: ", config)
     print("actual config: ", READ_INTERVAL, READ_PROCESSING, ACTIVE)
+    publish_config_state(client_ref)
 
 
 def announce(client):
@@ -108,6 +112,23 @@ def announce(client):
     # connects later still sees us without waiting for the next sensor message.
     client.publish(STATUS_TOPIC, b"online", retain=True, qos=0)
     print(f"{device_id} announced online on {STATUS_TOPIC.decode()}.")
+
+
+# Reference to the live client so sub_cb (called by client.check_msg) can publish.
+client_ref = None
+
+
+def publish_config_state(client):
+    # Retained snapshot of the applied config, so the bot sees ground truth even
+    # for a device that is currently offline.
+    if client is None:
+        return
+    payload = json.dumps({
+        "read_interval": READ_INTERVAL,
+        "read_processing": READ_PROCESSING,
+        "active": ACTIVE,
+    })
+    client.publish(CONFIG_STATE_TOPIC, payload.encode(), retain=True, qos=0)
 
 
 def connect_mqtt():
@@ -120,7 +141,12 @@ def connect_mqtt():
     client.set_last_will(STATUS_TOPIC, b"offline", retain=True, qos=0)
     client.connect()
     client.subscribe(CONFIG_TOPIC)
+    global client_ref
+    client_ref = client
     announce(client)
+    # Publish the current applied config once on connect so the bot sees ground
+    # truth immediately (retained), even before any new config is pushed.
+    publish_config_state(client)
     print(f"{device_id} connected to MQTT broker and subscribed to config.")
     return client
 

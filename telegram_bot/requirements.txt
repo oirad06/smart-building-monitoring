@@ -1,3 +1,4 @@
 python-telegram-bot>=21.0
 python-dotenv
 paho-mqtt>=2.0
+matplotlib

@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import warnings
 from datetime import datetime, timezone
@@ -31,6 +32,7 @@ from rooms import (
     room_exists,
     update_room,
 )
+import presence
 
 from dotenv import load_dotenv
 from paho.mqtt import client as mqtt
@@ -162,7 +164,7 @@ def send_device_config(device_id, read_interval, read_processing, active):
         "read_processing": read_processing,
         "active": active,
     })
-    mqtt_client.publish(f"sensor/{device_id}/config", payload)
+    mqtt_client.publish(f"sensor/{device_id}/config", payload, retain=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -189,7 +191,6 @@ RM_PICK, RM_MENU, RM_RENAME, RM_AC, RM_DEVICES, RM_DELETE, RM_REMOVE = range(30,
 # /events
 EV_PAGE, EV_EDIT_PEOPLE, EV_EDIT_COOL, EV_EDIT_HEAT = range(40, 44)
 
-ROOMS_PER_PAGE = 0  # unused sentinel
 EVENTS_PER_PAGE = 10
 
 
@@ -278,12 +279,29 @@ def _fmt_time(s):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
 
 
+SENSORS_DB = DATA_DIR / "monitor.db"
+_SENSOR_COLS = ["timestamp", "device_id", "room", "type", "min", "max", "media", "varianza"]
+
+
 def read_sensors():
-    path = DATA_DIR / "sensors.csv"
-    if not path.exists():
+    """Return all sensor readings from monitor.db as list[dict] with STRING values,
+    keys timestamp,device_id,room,type,min,max,media,varianza, ordered by time."""
+    if not SENSORS_DB.exists():
         return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    conn = sqlite3.connect(SENSORS_DB)
+    try:
+        cur = conn.execute(
+            "SELECT timestamp, device_id, room, type, min, max, media, varianza "
+            "FROM sensor_readings ORDER BY timestamp"
+        )
+        out = []
+        for row in cur.fetchall():
+            out.append({k: ("" if v is None else str(v)) for k, v in zip(_SENSOR_COLS, row)})
+        return out
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,9 +323,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/events — modifica o elimina eventi recenti\n"
         "/devices — vedi e modifica la configurazione dei sensori ESP32 (valori + stanza)\n"
         "/show — mostra dati sensori + eventi\n"
+        "/chart — grafico storico (media) dei sensori per stanza\n"
         "/sensors — scarica sensors.csv\n"
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
+        "/status — stato del sistema (MQTT, dispositivi, sensori, stanze)\n"
+        "/alerts — configura le soglie di allerta per stanza (notifiche automatiche)\n"
         "/cancel — annulla l'operazione (oppure usa il pulsante ❌ Annulla in ogni flusso)",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -876,7 +897,7 @@ def _device_list_text_kb():
     for dev in devices:
         room = get_device_room(dev) or "—"
         age = int(now - known_devices.get(dev, now))
-        lines.append(f"• {dev} | stanza: {room} | ultimo segnale: {age}s fa")
+        lines.append(f"{presence.status_icon(dev)} {dev} | stanza: {room} | ultimo segnale: {age}s fa")
         rows.append([InlineKeyboardButton(f"Configura {dev}", callback_data=f"devcfg_{dev}")])
     rows.append([cancel_button()])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
@@ -938,8 +959,10 @@ def _device_menu_text(context):
         f"Letture per finestra: {cfg['read_processing']}\n"
         f"Stato: {'Acceso' if cfg['active'] else 'Spento'}"
     )
-    if not context.user_data.get("dev_saved"):
-        text += "\n\n(Valori predefiniti: nessuna configurazione salvata.)"
+    if presence.is_confirmed(dev):
+        text += "\n\n(configurazione confermata dal dispositivo)"
+    else:
+        text += "\n\n(valori non confermati dal dispositivo)"
     return text
 
 
@@ -1152,6 +1175,16 @@ def _csv_filtered_bytes(path, room):
     return io.BytesIO(out.getvalue().encode()), len(rows)
 
 
+def _sensors_csv_bytes(room=None):
+    """Build a CSV (header + rows) from monitor.db via read_sensors(), optionally filtered by room."""
+    rows = [r for r in read_sensors() if (room is None or r.get("room") == room)]
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=_SENSOR_COLS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return io.BytesIO(out.getvalue().encode()), len(rows)
+
+
 async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global handler for /show, /sensors, /actions, /config inline choices."""
     query = update.callback_query
@@ -1167,18 +1200,15 @@ async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # /sensors
     elif data == "sensors_all":
-        path = DATA_DIR / "sensors.csv"
-        if path.exists() and path.stat().st_size:
-            await query.message.reply_document(document=open(path, "rb"), filename="sensors.csv")
+        bio, n = _sensors_csv_bytes(None)
+        if n:
+            await query.message.reply_document(document=bio, filename="sensors.csv")
         else:
-            await query.message.reply_text("sensors.csv vuoto o assente.")
+            await query.message.reply_text("Nessun dato sensori.")
     elif data.startswith("sensors_room_"):
         room = data[len("sensors_room_"):]
-        bio, n = _csv_filtered_bytes(DATA_DIR / "sensors.csv", room)
-        if bio is None:
-            await query.message.reply_text("sensors.csv assente.")
-        else:
-            await query.message.reply_document(document=bio, filename=f"sensors_{room}.csv")
+        bio, n = _sensors_csv_bytes(room)
+        await query.message.reply_document(document=bio, filename=f"sensors_{room}.csv")
 
     # /actions
     elif data == "actions_all":
@@ -1233,10 +1263,13 @@ async def post_init(application: Application):
         BotCommand("events", "Modifica o elimina eventi recenti"),
         BotCommand("devices", "Configura i sensori ESP32"),
         BotCommand("show", "Mostra dati sensori ed eventi"),
+        BotCommand("chart", "Grafico storico dei sensori"),
+        BotCommand("alerts", "Configura soglie di allerta"),
         BotCommand("sensors", "Scarica dati sensori"),
         BotCommand("actions", "Scarica dati eventi"),
         BotCommand("config", "Scarica configurazione stanze"),
         BotCommand("cancel", "Annulla operazione"),
+        BotCommand("status", "Stato del sistema"),
     ])
     global mqtt_client
     try:
@@ -1269,7 +1302,16 @@ def _install_features(app):
     """Feature plugins register their handlers here (auth, charts, status,
     alerts, …). Each feature adds one import + install() call. Runs before the
     catch-all echo handler so feature commands take precedence."""
-    pass
+    import auth
+    auth.install(app)
+    import presence
+    presence.install(app)
+    import status_cmd
+    status_cmd.install(app)
+    import charts
+    charts.install(app)
+    import alerts
+    alerts.install(app)
 
 
 def _build_application():

@@ -14,14 +14,24 @@ shared `data/` folder.
 | `/events` | Browse/edit/delete recent events with pagination |
 | `/devices` | List known ESP32s, then a per-device menu to view the current config (interval, window, active) + assigned room, change individual values, reassign/remove the room, and save (pushes config over MQTT) |
 | `/show` | Merged view of sensor + event data (last 10), filterable by room |
+| `/chart` | Render a time-series chart of average sensor values (per room or all) |
 | `/sensors` | Download `sensors.csv` (full export or per room) |
 | `/actions` | Download `actions.csv` (full export or per room) |
 | `/config` | Download `rooms.json` (all rooms or single room) |
+| `/alerts` | Set per-room temperature/humidity thresholds; breaches trigger automatic Telegram alerts (debounced) to `ALERT_CHAT_ID` |
 | `/cancel` | Abort any in-progress conversation |
+| `/status` | System health summary (MQTT, known devices, last sensor data, room count) |
 
 Every conversation also carries an inline **❌ Annulla** button (and **« Indietro**
 in menus); free-text prompts add a cancel key to the keyboard, so `/cancel` is
 never required. The bot menu is registered automatically via `set_my_commands`.
+
+## Access control
+
+Set `ALLOWED_USER_IDS` in `.env` to a comma/space separated list of Telegram
+user IDs to restrict the bot to those users; anyone else gets
+`⛔ Non sei autorizzato a usare questo bot.` and is blocked. Leave it empty or
+unset to keep the bot open to everyone (default, backward compatible).
 
 ## Setup
 

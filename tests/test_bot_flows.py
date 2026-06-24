@@ -190,7 +190,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         app = bot._build_application()
         convs = [h for grp in app.handlers.values() for h in grp
                  if isinstance(h, ConversationHandler)]
-        self.assertEqual(len(convs), 6)  # setup, rooms, event, events, devices, alerts
+        self.assertEqual(len(convs), 7)  # setup, rooms, event, events, devices, alerts, chart
         for c in convs:
             kinds = [type(f).__name__ for f in c.fallbacks]
             self.assertEqual(

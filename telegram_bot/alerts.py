@@ -135,13 +135,13 @@ def _fmt(v, unit):
 
 def _menu_text(room):
     cfg = get_room(room) or {}
+    t = f"{_fmt(cfg.get('temp_min'), '')}–{_fmt(cfg.get('temp_max'), '')}"
+    h = f"{_fmt(cfg.get('hum_min'), '')}–{_fmt(cfg.get('hum_max'), '')}"
     return (
-        f"Soglie di allerta per «{room}»:\n"
-        f"• Temp. min: {_fmt(cfg.get('temp_min'), '°C')}\n"
-        f"• Temp. max: {_fmt(cfg.get('temp_max'), '°C')}\n"
-        f"• Umidità min: {_fmt(cfg.get('hum_min'), '%')}\n"
-        f"• Umidità max: {_fmt(cfg.get('hum_max'), '%')}\n\n"
-        "Scegli una soglia da impostare o azzerare."
+        f"Soglie di allerta «{room}»\n"
+        f"🌡️ {t} °C\n"
+        f"💧 {h} %\n\n"
+        "Tocca una soglia per impostarla o azzerarla."
     )
 
 
@@ -151,20 +151,20 @@ def _menu_keyboard():
     import bot
     rows = [
         [
-            InlineKeyboardButton("Imposta Temp. min", callback_data="al_set_tmin"),
-            InlineKeyboardButton("Imposta Temp. max", callback_data="al_set_tmax"),
+            InlineKeyboardButton("🌡️ ⬇ imposta", callback_data="al_set_tmin"),
+            InlineKeyboardButton("🌡️ ⬆ imposta", callback_data="al_set_tmax"),
         ],
         [
-            InlineKeyboardButton("Imposta Umidità min", callback_data="al_set_hmin"),
-            InlineKeyboardButton("Imposta Umidità max", callback_data="al_set_hmax"),
+            InlineKeyboardButton("💧 ⬇ imposta", callback_data="al_set_hmin"),
+            InlineKeyboardButton("💧 ⬆ imposta", callback_data="al_set_hmax"),
         ],
         [
-            InlineKeyboardButton("Azzera Temp. min", callback_data="al_clear_temp_min"),
-            InlineKeyboardButton("Azzera Temp. max", callback_data="al_clear_temp_max"),
+            InlineKeyboardButton("🗑️ 🌡️⬇", callback_data="al_clear_temp_min"),
+            InlineKeyboardButton("🗑️ 🌡️⬆", callback_data="al_clear_temp_max"),
         ],
         [
-            InlineKeyboardButton("Azzera Umidità min", callback_data="al_clear_hum_min"),
-            InlineKeyboardButton("Azzera Umidità max", callback_data="al_clear_hum_max"),
+            InlineKeyboardButton("🗑️ 💧⬇", callback_data="al_clear_hum_min"),
+            InlineKeyboardButton("🗑️ 💧⬆", callback_data="al_clear_hum_max"),
         ],
         [bot.back_button("al_back_rooms")],
         [bot.cancel_button()],

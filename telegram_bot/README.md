@@ -14,7 +14,7 @@ shared `data/` folder.
 | `/events` | Browse/edit/delete recent events with pagination |
 | `/devices` | List known ESP32s, then a per-device menu to view the current config (interval, window, active) + assigned room, change individual values, reassign/remove the room, and save (pushes config over MQTT) |
 | `/show` | Merged view of sensor + event data (last 10), filterable by room |
-| `/chart` | Render a time-series chart of average sensor values (per room or all) |
+| `/chart` | Time-series chart for one or more rooms over a chosen horizon (last hour/day/week/month/all). Data is resampled in SQLite to a horizon-appropriate bucket; each room is one colored mean line with a shaded min/max band |
 | `/sensors` | Download `sensors.csv` (full export or per room) |
 | `/actions` | Download `actions.csv` (full export or per room) |
 | `/config` | Download `rooms.json` (all rooms or single room) |
@@ -24,7 +24,9 @@ shared `data/` folder.
 
 Every conversation also carries an inline **❌ Annulla** button (and **« Indietro**
 in menus); free-text prompts add a cancel key to the keyboard, so `/cancel` is
-never required. The bot menu is registered automatically via `set_my_commands`.
+never required, and menus collapse once you pick an option. Slow operations
+(charts, /show, downloads) show a ⏳ placeholder while they run. Device ids are
+shown by their last 5 characters. The bot menu is registered via `set_my_commands`.
 
 ## Access control
 

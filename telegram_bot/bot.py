@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import time
 import warnings
 from datetime import datetime, timezone
@@ -256,7 +257,7 @@ def device_keyboard(devices, assigned, selected):
     for dev in devices:
         room = assigned.get(dev)
         mark = "✅ " if dev in selected else ""
-        label = mark + dev + (f" ({room})" if room else "")
+        label = mark + short_id(dev) + (f" ({room})" if room else "")
         rows.append([InlineKeyboardButton(label, callback_data=dev)])
     rows.append([InlineKeyboardButton("Done", callback_data="done")])
     rows.append([cancel_button()])
@@ -304,6 +305,29 @@ def read_sensors():
         conn.close()
 
 
+def short_id(device_id):
+    """User-facing device id: last 5 chars. Full id stays in callback_data."""
+    return device_id[-5:] if device_id else device_id
+
+
+async def _collapse(query, label=None):
+    """Auto-collapse a menu after a selection: relabel the message (which drops
+    its inline keyboard) or just strip the keyboard. Best-effort."""
+    try:
+        if label is not None:
+            await query.edit_message_text(label)
+        else:
+            await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def _loading(query, text="⏳ Attendere, elaborazione in corso…"):
+    """Show a loading placeholder for slow ops (the RPi is slow at reads/plots).
+    Returns the sent message so the caller can edit/delete it when ready."""
+    return await query.message.reply_text(text)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # /start, /help, /cancel
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,7 +347,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/events — modifica o elimina eventi recenti\n"
         "/devices — vedi e modifica la configurazione dei sensori ESP32 (valori + stanza)\n"
         "/show — mostra dati sensori + eventi\n"
-        "/chart — grafico storico (media) dei sensori per stanza\n"
+        "/chart — grafico storico per una o più stanze, periodo a scelta (media + banda min/max)\n"
         "/sensors — scarica sensors.csv\n"
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
@@ -407,7 +431,7 @@ async def save_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for dev in selected:
             current = get_device_room(dev)
             if current:
-                warnings.append(f"{dev} è già assegnato a '{current}'")
+                warnings.append(f"{short_id(dev)} è già assegnato a '{current}'")
 
         if warnings and not context.user_data.get("confirmed"):
             context.user_data["confirmed"] = True
@@ -421,7 +445,7 @@ async def save_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         add_room(room_name, selected, context.user_data["num_ac"])
         await query.edit_message_text(
             f"✅ Stanza '{room_name}' creata.\n"
-            f"Dispositivi: {', '.join(selected) if selected else 'nessuno'}"
+            f"Dispositivi: {', '.join(short_id(d) for d in selected) if selected else 'nessuno'}"
         )
         context.user_data.clear()
         return ConversationHandler.END
@@ -446,7 +470,7 @@ def _room_menu_text(name):
     return (
         f"Stanza: {name}\n"
         f"AC totali: {room['num_ac']}\n"
-        f"Dispositivi: {', '.join(room.get('device_ids', [])) or 'nessuno'}"
+        f"Dispositivi: {', '.join(short_id(d) for d in room.get('device_ids', [])) or 'nessuno'}"
     )
 
 
@@ -618,7 +642,7 @@ async def _rooms_back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def _room_remove_markup(name):
     ids = (get_room(name) or {}).get("device_ids", [])
-    rows = [[InlineKeyboardButton(f"🗑 {d}", callback_data=f"rmrm_{d}")] for d in ids]
+    rows = [[InlineKeyboardButton(f"🗑 {short_id(d)}", callback_data=f"rmrm_{d}")] for d in ids]
     rows.append([back_button("rmrm_back"), cancel_button()])
     return InlineKeyboardMarkup(rows)
 
@@ -897,8 +921,8 @@ def _device_list_text_kb():
     for dev in devices:
         room = get_device_room(dev) or "—"
         age = int(now - known_devices.get(dev, now))
-        lines.append(f"{presence.status_icon(dev)} {dev} | stanza: {room} | ultimo segnale: {age}s fa")
-        rows.append([InlineKeyboardButton(f"Configura {dev}", callback_data=f"devcfg_{dev}")])
+        lines.append(f"{presence.status_icon(dev)} {short_id(dev)} | stanza: {room} | ultimo segnale: {age}s fa")
+        rows.append([InlineKeyboardButton(f"Configura {short_id(dev)}", callback_data=f"devcfg_{dev}")])
     rows.append([cancel_button()])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
@@ -953,7 +977,7 @@ def _device_menu_text(context):
     cfg = context.user_data["dev_cfg"]
     room = context.user_data.get("dev_room")
     text = (
-        f"Configurazione di {dev}\n\n"
+        f"Configurazione di {short_id(dev)}\n\n"
         f"Stanza: {room or 'nessuna'}\n"
         f"Intervallo lettura: {cfg['read_interval']} s\n"
         f"Letture per finestra: {cfg['read_processing']}\n"
@@ -1041,7 +1065,7 @@ async def _show_device_room_menu(update: Update, context: ContextTypes.DEFAULT_T
     current = context.user_data.get("dev_room")
     dev = context.user_data["device"]
     text = (
-        f"Stanza per {dev}: {current or 'nessuna'}\n"
+        f"Stanza per {short_id(dev)}: {current or 'nessuna'}\n"
         "Seleziona una stanza o rimuovi l'assegnazione:"
     )
     await update.callback_query.edit_message_text(text, reply_markup=_device_room_markup(current))
@@ -1089,7 +1113,7 @@ async def _save_device_config(update: Update, context: ContextTypes.DEFAULT_TYPE
         room_line = f"\nStanza: {orig_room or 'nessuna'}"
 
     await update.callback_query.edit_message_text(
-        f"✅ Configurazione inviata a {dev}.\n"
+        f"✅ Configurazione inviata a {short_id(dev)}.\n"
         f"Intervallo: {cfg['read_interval']}s | Letture: {cfg['read_processing']} | "
         f"Stato: {'Acceso' if cfg['active'] else 'Spento'}"
         + room_line
@@ -1125,7 +1149,7 @@ def _format_merged(rows):
         t = _fmt_time(r.get("timestamp"))
         room = r.get("room", "")
         if r["_source"] == "sensor":
-            out.append(f"{t} | {room} | {r.get('device_id')} | {r.get('type')}: "
+            out.append(f"{t} | {room} | {short_id(r.get('device_id'))} | {r.get('type')}: "
                        f"media {r.get('media')} (min {r.get('min')}, max {r.get('max')})")
         else:
             out.append(f"{t} | {room} | persone {r.get('num_people')} | "
@@ -1186,62 +1210,63 @@ def _sensors_csv_bytes(room=None):
 
 
 async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Global handler for /show, /sensors, /actions, /config inline choices."""
+    """Global handler for /show, /sensors, /actions, /config inline choices.
+    Collapses the picker and shows a loading note first (the RPi is slow)."""
     query = update.callback_query
     await query.answer()
     data = query.data
+    await _collapse(query)
+    note = await _loading(query)
+
+    async def _doc(bio, filename):
+        await note.delete()
+        await query.message.reply_document(document=bio, filename=filename)
 
     # /show
     if data == "show_all":
-        await query.message.reply_text(_format_merged(_merge_rows(None)))
-        return
-    if data.startswith("show_room_"):
-        await query.message.reply_text(_format_merged(_merge_rows(data[len("show_room_"):])))
+        await note.edit_text(_format_merged(_merge_rows(None)))
+    elif data.startswith("show_room_"):
+        await note.edit_text(_format_merged(_merge_rows(data[len("show_room_"):])))
 
     # /sensors
     elif data == "sensors_all":
         bio, n = _sensors_csv_bytes(None)
-        if n:
-            await query.message.reply_document(document=bio, filename="sensors.csv")
-        else:
-            await query.message.reply_text("Nessun dato sensori.")
+        await (_doc(bio, "sensors.csv") if n else note.edit_text("Nessun dato sensori."))
     elif data.startswith("sensors_room_"):
         room = data[len("sensors_room_"):]
         bio, n = _sensors_csv_bytes(room)
-        await query.message.reply_document(document=bio, filename=f"sensors_{room}.csv")
+        await (_doc(bio, f"sensors_{room}.csv") if n else note.edit_text("Nessun dato per la stanza."))
 
     # /actions
     elif data == "actions_all":
         path = DATA_DIR / "actions.csv"
         if path.exists() and path.stat().st_size:
-            await query.message.reply_document(document=open(path, "rb"), filename="actions.csv")
+            await _doc(open(path, "rb"), "actions.csv")
         else:
-            await query.message.reply_text("actions.csv vuoto o assente.")
+            await note.edit_text("actions.csv vuoto o assente.")
     elif data.startswith("actions_room_"):
         room = data[len("actions_room_"):]
         bio, n = _csv_filtered_bytes(DATA_DIR / "actions.csv", room)
         if bio is None:
-            await query.message.reply_text("actions.csv assente.")
+            await note.edit_text("actions.csv assente.")
         else:
-            await query.message.reply_document(document=bio, filename=f"actions_{room}.csv")
+            await _doc(bio, f"actions_{room}.csv")
 
     # /config
     elif data == "config_all":
         path = DATA_DIR / "rooms.json"
         if path.exists() and path.stat().st_size:
-            await query.message.reply_document(document=open(path, "rb"), filename="rooms.json")
+            await _doc(open(path, "rb"), "rooms.json")
         else:
-            await query.message.reply_text("rooms.json vuoto o assente.")
+            await note.edit_text("rooms.json vuoto o assente.")
     elif data.startswith("config_room_"):
         room = data[len("config_room_"):]
         room_cfg = get_room(room)
         if room_cfg is None:
-            await query.message.reply_text("Stanza non trovata.")
+            await note.edit_text("Stanza non trovata.")
         else:
             text = json.dumps({room: room_cfg}, indent=2, ensure_ascii=False)
-            await query.message.reply_document(
-                document=io.BytesIO(text.encode()), filename=f"{room}_config.json"
-            )
+            await _doc(io.BytesIO(text.encode()), f"{room}_config.json")
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1397,6 +1422,11 @@ def _build_application():
 
 
 def main():
+    # Launched as `python bot.py`, this module is '__main__'; feature plugins do
+    # `import bot` and would otherwise load a SECOND, empty copy (mqtt_client=None,
+    # empty known_devices, a separate _message_listeners list → dead presence/
+    # alerts and a bogus /status). Alias so every `import bot` resolves here.
+    sys.modules.setdefault("bot", sys.modules[__name__])
     app = _build_application()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

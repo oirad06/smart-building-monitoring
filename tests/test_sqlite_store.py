@@ -26,12 +26,21 @@ class FakeMsg:
     def __init__(self):
         self.docs = []
         self.texts = []
+        self.edited = []
+        self.deleted = False
 
     async def reply_document(self, document=None, filename=None, **kw):
         self.docs.append((document, filename))
 
     async def reply_text(self, text, **kw):
         self.texts.append(text)
+        return FakeMsg()  # the loading note
+
+    async def edit_text(self, text, **kw):
+        self.edited.append(text)
+
+    async def delete(self):
+        self.deleted = True
 
 
 class FakeQuery:
@@ -40,6 +49,12 @@ class FakeQuery:
         self.message = FakeMsg()
 
     async def answer(self, *a, **kw):
+        pass
+
+    async def edit_message_text(self, text=None, reply_markup=None, **kw):
+        self.message.texts.append(text)
+
+    async def edit_message_reply_markup(self, reply_markup=None, **kw):
         pass
 
 

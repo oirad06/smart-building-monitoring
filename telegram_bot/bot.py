@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import warnings
 from datetime import datetime, timezone
@@ -278,12 +279,29 @@ def _fmt_time(s):
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "?"
 
 
+SENSORS_DB = DATA_DIR / "monitor.db"
+_SENSOR_COLS = ["timestamp", "device_id", "room", "type", "min", "max", "media", "varianza"]
+
+
 def read_sensors():
-    path = DATA_DIR / "sensors.csv"
-    if not path.exists():
+    """Return all sensor readings from monitor.db as list[dict] with STRING values,
+    keys timestamp,device_id,room,type,min,max,media,varianza, ordered by time."""
+    if not SENSORS_DB.exists():
         return []
-    with open(path, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    conn = sqlite3.connect(SENSORS_DB)
+    try:
+        cur = conn.execute(
+            "SELECT timestamp, device_id, room, type, min, max, media, varianza "
+            "FROM sensor_readings ORDER BY timestamp"
+        )
+        out = []
+        for row in cur.fetchall():
+            out.append({k: ("" if v is None else str(v)) for k, v in zip(_SENSOR_COLS, row)})
+        return out
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1152,6 +1170,16 @@ def _csv_filtered_bytes(path, room):
     return io.BytesIO(out.getvalue().encode()), len(rows)
 
 
+def _sensors_csv_bytes(room=None):
+    """Build a CSV (header + rows) from monitor.db via read_sensors(), optionally filtered by room."""
+    rows = [r for r in read_sensors() if (room is None or r.get("room") == room)]
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=_SENSOR_COLS)
+    writer.writeheader()
+    writer.writerows(rows)
+    return io.BytesIO(out.getvalue().encode()), len(rows)
+
+
 async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Global handler for /show, /sensors, /actions, /config inline choices."""
     query = update.callback_query
@@ -1167,18 +1195,15 @@ async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # /sensors
     elif data == "sensors_all":
-        path = DATA_DIR / "sensors.csv"
-        if path.exists() and path.stat().st_size:
-            await query.message.reply_document(document=open(path, "rb"), filename="sensors.csv")
+        bio, n = _sensors_csv_bytes(None)
+        if n:
+            await query.message.reply_document(document=bio, filename="sensors.csv")
         else:
-            await query.message.reply_text("sensors.csv vuoto o assente.")
+            await query.message.reply_text("Nessun dato sensori.")
     elif data.startswith("sensors_room_"):
         room = data[len("sensors_room_"):]
-        bio, n = _csv_filtered_bytes(DATA_DIR / "sensors.csv", room)
-        if bio is None:
-            await query.message.reply_text("sensors.csv assente.")
-        else:
-            await query.message.reply_document(document=bio, filename=f"sensors_{room}.csv")
+        bio, n = _sensors_csv_bytes(room)
+        await query.message.reply_document(document=bio, filename=f"sensors_{room}.csv")
 
     # /actions
     elif data == "actions_all":

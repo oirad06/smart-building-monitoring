@@ -305,6 +305,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/events — modifica o elimina eventi recenti\n"
         "/devices — vedi e modifica la configurazione dei sensori ESP32 (valori + stanza)\n"
         "/show — mostra dati sensori + eventi\n"
+        "/chart — grafico storico (media) dei sensori per stanza\n"
         "/sensors — scarica sensors.csv\n"
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
@@ -1233,6 +1234,7 @@ async def post_init(application: Application):
         BotCommand("events", "Modifica o elimina eventi recenti"),
         BotCommand("devices", "Configura i sensori ESP32"),
         BotCommand("show", "Mostra dati sensori ed eventi"),
+        BotCommand("chart", "Grafico storico dei sensori"),
         BotCommand("sensors", "Scarica dati sensori"),
         BotCommand("actions", "Scarica dati eventi"),
         BotCommand("config", "Scarica configurazione stanze"),
@@ -1269,7 +1271,8 @@ def _install_features(app):
     """Feature plugins register their handlers here (auth, charts, status,
     alerts, …). Each feature adds one import + install() call. Runs before the
     catch-all echo handler so feature commands take precedence."""
-    pass
+    import charts
+    charts.install(app)
 
 
 def _build_application():

@@ -14,6 +14,7 @@ shared `data/` folder.
 | `/events` | Browse/edit/delete recent events with pagination |
 | `/devices` | List known ESP32s, then a per-device menu to view the current config (interval, window, active) + assigned room, change individual values, reassign/remove the room, and save (pushes config over MQTT) |
 | `/show` | Merged view of sensor + event data (last 10), filterable by room |
+| `/chart` | Render a time-series chart of average sensor values (per room or all) |
 | `/sensors` | Download `sensors.csv` (full export or per room) |
 | `/actions` | Download `actions.csv` (full export or per room) |
 | `/config` | Download `rooms.json` (all rooms or single room) |

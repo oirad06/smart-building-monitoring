@@ -18,6 +18,7 @@ shared `data/` folder.
 | `/sensors` | Download `sensors.csv` (full export or per room) |
 | `/actions` | Download `actions.csv` (full export or per room) |
 | `/config` | Download `rooms.json` (all rooms or single room) |
+| `/alerts` | Set per-room temperature/humidity thresholds; breaches trigger automatic Telegram alerts (debounced) to `ALERT_CHAT_ID` |
 | `/cancel` | Abort any in-progress conversation |
 | `/status` | System health summary (MQTT, known devices, last sensor data, room count) |
 

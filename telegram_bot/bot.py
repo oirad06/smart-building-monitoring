@@ -328,6 +328,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/actions — scarica actions.csv\n"
         "/config — scarica rooms.json\n"
         "/status — stato del sistema (MQTT, dispositivi, sensori, stanze)\n"
+        "/alerts — configura le soglie di allerta per stanza (notifiche automatiche)\n"
         "/cancel — annulla l'operazione (oppure usa il pulsante ❌ Annulla in ogni flusso)",
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -1263,6 +1264,7 @@ async def post_init(application: Application):
         BotCommand("devices", "Configura i sensori ESP32"),
         BotCommand("show", "Mostra dati sensori ed eventi"),
         BotCommand("chart", "Grafico storico dei sensori"),
+        BotCommand("alerts", "Configura soglie di allerta"),
         BotCommand("sensors", "Scarica dati sensori"),
         BotCommand("actions", "Scarica dati eventi"),
         BotCommand("config", "Scarica configurazione stanze"),
@@ -1308,6 +1310,8 @@ def _install_features(app):
     status_cmd.install(app)
     import charts
     charts.install(app)
+    import alerts
+    alerts.install(app)
 
 
 def _build_application():

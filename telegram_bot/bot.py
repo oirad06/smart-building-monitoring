@@ -119,6 +119,17 @@ def run_on_bot_loop(coro):
     return None
 
 
+def register_message_listener(fn):
+    """Feature plugins: add a fn(topic, payload, parts) called on every MQTT
+    message (paho thread — never block; use run_on_bot_loop to reach the loop)."""
+    _message_listeners.append(fn)
+
+
+def register_post_init_hook(fn):
+    """Feature plugins: add an async fn(application) awaited once at startup."""
+    _post_init_hooks.append(fn)
+
+
 def _on_mqtt_message(client, userdata, msg):
     """Live device discovery: learn device IDs from any sensor message + the
     retained discovery snapshot published by the consumer."""

@@ -106,6 +106,20 @@ class SqliteStoreTest(unittest.TestCase):
     def test_read_sensors_empty_when_no_db(self):
         self.assertEqual(bot.read_sensors(), [])
 
+    def test_write_succeeds_with_concurrent_open_reader(self):
+        # A bot read transaction (e.g. chart render / read_sensors on the 21MB DB)
+        # must NOT make the consumer's write fail with "database is locked".
+        sensor.append_sensor_row("100", "espA", "Aula1", "temperature", 1, 9, 5, 2)
+        reader = sqlite3.connect(self.db)
+        try:
+            reader.execute("BEGIN")
+            reader.execute("SELECT * FROM sensor_readings").fetchall()
+            # Writer runs while the reader still holds its transaction open.
+            sensor.append_sensor_row("200", "espB", "Aula2", "humidity", 0, 1, 0.5, 0.1)
+        finally:
+            reader.close()
+        self.assertEqual(len(bot.read_sensors()), 2)
+
     def test_csv_export_all(self):
         sensor.append_sensor_row("100", "espA", "Aula1", "temperature", 1, 9, 5, 2)
         sensor.append_sensor_row("200", "espB", "Aula2", "humidity", 0, 1, 0.5, 0.1)

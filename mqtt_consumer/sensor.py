@@ -13,7 +13,13 @@ DB_FILE = DATA_DIR / "monitor.db"
 def _connect():
     """Open the monitor.db connection, creating the sensor_readings table if needed."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_FILE)
+    # WAL + a busy timeout let the consumer's writes coexist with the bot's
+    # concurrent reads (chart render / read_sensors) instead of failing with
+    # "database is locked". WAL is persistent in the DB header, so every
+    # connection (including the bot's) inherits it once set here.
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sensor_readings ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, "

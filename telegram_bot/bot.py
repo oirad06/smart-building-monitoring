@@ -289,7 +289,9 @@ def read_sensors():
     keys timestamp,device_id,room,type,min,max,media,varianza, ordered by time."""
     if not SENSORS_DB.exists():
         return []
-    conn = sqlite3.connect(SENSORS_DB)
+    # Read-only + busy timeout: never take a write lock and wait out a
+    # concurrent consumer write instead of failing under load.
+    conn = sqlite3.connect(f"file:{SENSORS_DB}?mode=ro", uri=True, timeout=30)
     try:
         cur = conn.execute(
             "SELECT timestamp, device_id, room, type, min, max, media, varianza "

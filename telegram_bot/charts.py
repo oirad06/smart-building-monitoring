@@ -81,7 +81,7 @@ def _aggregate(device_ids, since_epoch, bucket_secs):
     q += " GROUP BY bucket, type ORDER BY bucket"
 
     series = {}
-    conn = sqlite3.connect(f"file:{bot.SENSORS_DB}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{bot.SENSORS_DB}?mode=ro", uri=True, timeout=30)
     try:
         try:
             cur = conn.execute(q, params)

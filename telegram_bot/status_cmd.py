@@ -1,4 +1,5 @@
 """/status — riepilogo salute del sistema (comando one-shot)."""
+import asyncio
 import time
 
 from telegram import Update, ReplyKeyboardRemove
@@ -20,7 +21,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fresh = sum(1 for t in bot.known_devices.values() if now - t < FRESH_SECS)
     stale = total - fresh
 
-    rows = bot.read_sensors()
+    rows = await asyncio.to_thread(bot.read_sensors)
     last_ts = 0.0
     for r in rows:
         ts = bot._parse_ts(r.get("timestamp"))

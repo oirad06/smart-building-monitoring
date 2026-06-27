@@ -1226,17 +1226,19 @@ async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # /show
     if data == "show_all":
-        await note.edit_text(_format_merged(_merge_rows(None)))
+        rows = await asyncio.to_thread(_merge_rows, None)
+        await note.edit_text(_format_merged(rows))
     elif data.startswith("show_room_"):
-        await note.edit_text(_format_merged(_merge_rows(data[len("show_room_"):])))
+        rows = await asyncio.to_thread(_merge_rows, data[len("show_room_"):])
+        await note.edit_text(_format_merged(rows))
 
     # /sensors
     elif data == "sensors_all":
-        bio, n = _sensors_csv_bytes(None)
+        bio, n = await asyncio.to_thread(_sensors_csv_bytes, None)
         await (_doc(bio, "sensors.csv") if n else note.edit_text("Nessun dato sensori."))
     elif data.startswith("sensors_room_"):
         room = data[len("sensors_room_"):]
-        bio, n = _sensors_csv_bytes(room)
+        bio, n = await asyncio.to_thread(_sensors_csv_bytes, room)
         await (_doc(bio, f"sensors_{room}.csv") if n else note.edit_text("Nessun dato per la stanza."))
 
     # /actions
@@ -1248,7 +1250,7 @@ async def downloads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await note.edit_text("actions.csv vuoto o assente.")
     elif data.startswith("actions_room_"):
         room = data[len("actions_room_"):]
-        bio, n = _csv_filtered_bytes(DATA_DIR / "actions.csv", room)
+        bio, n = await asyncio.to_thread(_csv_filtered_bytes, DATA_DIR / "actions.csv", room)
         if bio is None:
             await note.edit_text("actions.csv assente.")
         else:
@@ -1430,7 +1432,7 @@ def main():
     # alerts and a bogus /status). Alias so every `import bot` resolves here.
     sys.modules.setdefault("bot", sys.modules[__name__])
     app = _build_application()
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":

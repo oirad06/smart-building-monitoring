@@ -13,6 +13,7 @@ Design notes:
   distinct colors from the matplotlib cycle. Temperature and humidity render as
   two stacked, time-aligned subplots.
 """
+import asyncio
 import io
 import sqlite3
 import time
@@ -21,7 +22,7 @@ from datetime import datetime
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.figure import Figure  # noqa: E402
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update  # noqa: E402
 from telegram.ext import (  # noqa: E402
@@ -134,9 +135,8 @@ def render_chart(series, horizon_label):
     if not present:
         return None
 
-    fig, axes = plt.subplots(
-        len(present), 1, figsize=(9, 3.3 * len(present)), squeeze=False, sharex=True
-    )
+    fig = Figure(figsize=(9, 3.3 * len(present)))
+    axes = fig.subplots(len(present), 1, squeeze=False, sharex=True)
     for row, (mtype, axis_label) in enumerate(present):
         ax = axes[row][0]
         for idx, (room_label, agg) in enumerate(series):
@@ -157,7 +157,6 @@ def render_chart(series, horizon_label):
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png")
-    plt.close(fig)
     buf.seek(0)
     return buf
 
@@ -251,7 +250,7 @@ async def chart_horizon_action(update: Update, context: ContextTypes.DEFAULT_TYP
     label = _HORIZON[key][0]
     # Collapse the menu + show a loading note (rendering is slow on the RPi).
     await query.edit_message_text(f"⏳ Generazione del grafico ({label})…")
-    png = build_chart(rooms_sel, key)
+    png = await asyncio.to_thread(build_chart, rooms_sel, key)
     if png is None:
         await query.edit_message_text("Nessun dato disponibile per il periodo scelto.")
     else:
